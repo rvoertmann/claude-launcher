@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#
+# claude-launcher-close — close the windows a `claude-launcher` run created,
+# and only those. Reads the per-launch record written under $STATE_DIR and
+# closes exactly the Terminal / VS Code windows from that session.
+#
+# Usage:
+#   claude-launcher-close                 # close the most recent session
+#   claude-launcher-close --all           # close every recorded session
+#   claude-launcher-close --list          # list recorded sessions, close nothing
+#   claude-launcher-close <session-id>    # close a specific session
+#
+# On "current desktop only": macOS does not expose a window's Space (virtual
+# desktop) to unprivileged scripting, so this cannot *filter* by the desktop you
+# are currently viewing. Instead it targets the exact window IDs each launch
+# recorded — which were all created on one desktop — so it closes precisely that
+# launch's windows and never any pre-existing ones. If you dragged some of those
+# windows to another Space, they will still be closed (they belong to the launch).
+#
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-launcher"
+SESS_DIR="$STATE_DIR/sessions"
+
+# --- pick which session file(s) to act on ------------------------------------
+mode="last"
+want=""
+case "${1:-}" in
+  --all)  mode="all" ;;
+  --list) mode="list" ;;
+  "")     mode="last" ;;
+  --*)    echo "claude-launcher-close: unknown option '$1'" >&2; exit 2 ;;
+  *)      mode="one"; want="$1" ;;
+esac
+
+if [[ ! -d "$SESS_DIR" ]] || [[ -z "$(ls -A "$SESS_DIR" 2>/dev/null)" ]]; then
+  echo "claude-launcher-close: no recorded sessions"
+  exit 0
+fi
+
+# Parse a session file into shell vars WITHOUT sourcing it (values such as the
+# folder path may contain spaces, which `source` would split on).
+session=""; folder=""; vscode_title=""; terminal_ids=""; terminal_ttys=""
+parse_session() {
+  session=""; folder=""; vscode_title=""; terminal_ids=""; terminal_ttys=""
+  local key val
+  while IFS='=' read -r key val; do
+    case "$key" in
+      session)       session="$val" ;;
+      folder)        folder="$val" ;;
+      vscode_title)  vscode_title="$val" ;;
+      terminal_ids)  terminal_ids="$val" ;;
+      terminal_ttys) terminal_ttys="$val" ;;
+    esac
+  done < "$1"
+}
+
+if [[ "$mode" == "list" ]]; then
+  for f in "$SESS_DIR"/*.session; do
+    parse_session "$f"
+    printf '%s\t%s\n' "$session" "$folder"
+  done
+  exit 0
+fi
+
+# Build the list of session files to close.
+files=()
+case "$mode" in
+  all)  for f in "$SESS_DIR"/*.session; do files+=("$f"); done ;;
+  one)  f="$SESS_DIR/$want.session"
+        [[ -f "$f" ]] || { echo "claude-launcher-close: no such session '$want'" >&2; exit 1; }
+        files+=("$f") ;;
+  last) # newest by mtime
+        f="$(ls -t "$SESS_DIR"/*.session 2>/dev/null | head -1)"
+        [[ -n "$f" ]] && files+=("$f") ;;
+esac
+
+close_session() {
+  local file="$1"
+  parse_session "$file"
+
+  echo "closing session ${session:-?} ($folder)"
+
+  # Terminals: kill the shell on each recorded tty first (so no "terminate the
+  # Terminals: force-quit each session by SIGKILL-ing every process on its
+  # recorded tty (claude + the shell), so there is no "terminate the running
+  # process?" prompt and nothing lingers; then close the window by its id.
+  # (`pkill -t` is unreliable on macOS; enumerate PIDs with `ps -t` instead.)
+  for t in ${terminal_ttys:-}; do
+    pids="$(ps -t "${t#/dev/}" -o pid= 2>/dev/null || true)"
+    [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+  done
+  # Then close each window by its recorded id. (Terminal takes a couple of
+  # seconds to actually remove a window after its shell dies — that lag is
+  # cosmetic; the window does close. No retry/escalation needed.)
+  for id in ${terminal_ids:-}; do
+    osascript -e "tell application \"Terminal\"
+  try
+    close (every window whose id is ${id})
+  end try
+end tell" >/dev/null 2>&1 || true
+  done
+
+  # VS Code has no scriptable window id, so identify our window by its FULL
+  # folder path: the window whose open document (AXDocument, a file:// URL) sits
+  # inside the launched folder is unambiguously ours. Only if no file is open
+  # (fresh window, empty AXDocument) do we fall back to the basename title.
+  # Then close it and force-discard any "save changes?" sheet via "Don't Save".
+  if [[ -n "${folder:-}" ]]; then
+    osascript - "$folder" "${vscode_title:-}" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on urldecode(s)
+    -- decode the %20 that spaces in paths become in a file:// URL
+    set AppleScript's text item delimiters to "%20"
+    set parts to text items of s
+    set AppleScript's text item delimiters to " "
+    set out to parts as text
+    set AppleScript's text item delimiters to ""
+    return out
+end urldecode
+
+on run argv
+    set theFolder to item 1 of argv
+    set theTitle to item 2 of argv
+    try
+        tell application "System Events" to tell process "Code"
+            set target to missing value
+            -- Primary: a window whose active document lives inside theFolder.
+            repeat with w in windows
+                set doc to ""
+                try
+                    set doc to (value of attribute "AXDocument" of w) as text
+                end try
+                if doc is not "" then
+                    if (my urldecode(doc)) contains theFolder then
+                        set target to w
+                        exit repeat
+                    end if
+                end if
+            end repeat
+            -- Fallback: no file open anywhere, so match the basename title.
+            if (target is missing value) and (theTitle is not "") then
+                repeat with w in windows
+                    if (name of w) contains theTitle then
+                        set target to w
+                        exit repeat
+                    end if
+                end repeat
+            end if
+            if target is not missing value then
+                try
+                    click (first button of target whose subrole is "AXCloseButton")
+                end try
+                delay 0.3
+                try
+                    if (exists sheet 1 of target) then
+                        click (first button of sheet 1 of target whose name is "Don't Save")
+                    end if
+                end try
+            end if
+        end tell
+    end try
+end run
+APPLESCRIPT
+  fi
+
+  rm -f "$file"
+  # Drop the `last` pointer if it referenced this session.
+  if [[ "$(readlink "$STATE_DIR/last.session" 2>/dev/null)" == "$file" ]]; then
+    rm -f "$STATE_DIR/last.session"
+  fi
+}
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  echo "claude-launcher-close: no session to close"
+  exit 0
+fi
+
+for f in "${files[@]}"; do
+  close_session "$f"
+done
