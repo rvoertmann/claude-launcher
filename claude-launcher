@@ -1,27 +1,11 @@
 #!/usr/bin/env bash
 #
-# claude-launcher — tile Visual Studio Code + Claude Code terminals on the
-# current Space (virtual desktop).
+# claude-launcher — tile VS Code + Terminal.app windows on the current Space,
+# with each terminal running a Claude Code session in the target folder.
 #
-#   Left half   -> VS Code, opened on the target folder.
-#   Right half  -> Terminal.app windows, each running
-#                  `claude --dangerously-skip-permissions` in that folder.
-#
-# The right half holds a 2x2 grid of four terminals on a wide display, but only
-# two full-width terminals stacked vertically on a narrower one (a laptop's
-# built-in screen). Quartering the right half of a 16" MacBook Pro leaves each
-# terminal ~430pt wide, which Claude Code's output does not fit into; halving it
-# horizontally keeps each one readable.
-#
-# (No browser pane: macOS pins a running browser's new windows to the Space the
-# browser last used, with no scriptable way to place or move them onto the
-# current desktop. Every route failed in practice — scripted windows, a
-# synthesized Cmd+N, minimizing the other windows first, even a dedicated
-# second Safari instance — so the browser is left out rather than tiled onto
-# the wrong desktop. Open one yourself in the space beside VS Code if needed.)
-#
-# The windows created by each launch are recorded under $STATE_DIR so that
-# `claude-launcher-close` can later close exactly those windows (and only those).
+# All the tiling/VS Code/recording work lives in launcher-common.sh; this file
+# only pins the Claude Code command each terminal runs. See that library and the
+# README for the full picture.
 #
 # Usage:
 #   claude-launcher [folder] [plugin-dir]
@@ -32,291 +16,50 @@
 #   CLAUDE_LAUNCHER_LAYOUT   auto (default) | grid | stacked
 #   CLAUDE_LAUNCHER_MIN_COL  minimum terminal width, in points, that `auto`
 #                            requires before it chooses the grid (default 640)
-#
 set -euo pipefail
 
-USAGE="Usage: claude-launcher [folder] [plugin-dir]   (folder defaults to the current directory)"
-
-layout="${CLAUDE_LAUNCHER_LAYOUT:-auto}"
-case "$layout" in
-  auto|grid|stacked) ;;
-  *)
-    echo "claude-launcher: CLAUDE_LAUNCHER_LAYOUT must be auto, grid, or stacked (got '$layout')" >&2
-    exit 1
-    ;;
-esac
-minCol="${CLAUDE_LAUNCHER_MIN_COL:-640}"
-
-# State directory: records the windows each launch creates, so
-# `claude-launcher-close` can later close exactly those windows.
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-launcher"
-
-# ---------------------------------------------------------------------------
-# 1. Resolve the target folder (arg 1, or $PWD) to an absolute path.
-# ---------------------------------------------------------------------------
-target="${1:-$PWD}"
-if [[ ! -d "$target" ]]; then
-  echo "claude-launcher: '$target' is not a directory" >&2
-  echo "$USAGE" >&2
-  exit 1
-fi
-folder="$(cd "$target" && pwd)"
-folderName="$(basename "$folder")"
-
-# Optional arg 2: a Claude Code plugin directory, loaded via `--plugin-dir`.
-pluginDir=""
-if [[ -n "${2:-}" ]]; then
-  if [[ ! -d "$2" ]]; then
-    echo "claude-launcher: plugin directory '$2' is not a directory" >&2
-    echo "$USAGE" >&2
-    exit 1
-  fi
-  pluginDir="$(cd "$2" && pwd)"
-fi
-
-# ---------------------------------------------------------------------------
-# 2. Read the Dock-aware *visible frame* and compute the window boxes.
-#    NSScreen.visibleFrame excludes the menu bar and the Dock, so windows
-#    tile flush to those instead of hiding underneath them. JXA returns it as
-#    "VX VY VW VH" already converted to AppleScript's top-left coordinates.
-# ---------------------------------------------------------------------------
-read -r VX VY VW VH < <(
-  osascript -l JavaScript -e 'ObjC.import("AppKit"); var s=$.NSScreen.mainScreen; var f=s.frame; var v=s.visibleFrame; var top=f.size.height-(v.origin.y+v.size.height); [Math.round(v.origin.x),Math.round(top),Math.round(v.size.width),Math.round(v.size.height)].join(" ")'
-)
-if [[ -z "${VW:-}" || -z "${VH:-}" ]]; then
-  echo "claude-launcher: could not read the screen's visible frame" >&2
-  exit 1
-fi
-
-xHalf=$(( VX + VW / 2 ))          # boundary between VS Code (left) and terminals (right)
-xColMid=$(( VX + 3 * VW / 4 ))    # vertical split of the right half
-xRight=$(( VX + VW ))
-yTop=$VY
-yMid=$(( VY + VH / 2 ))           # horizontal split of the right half
-yBottom=$(( VY + VH ))
-
-# VS Code occupies the entire left half.
-vsX=$VX
-vsY=$yTop
-vsW=$(( VW / 2 ))
-vsH=$VH
-
-# Pick the terminal layout. In the grid each terminal is a quarter of the screen
-# wide; if that falls below $minCol points, stack two full-half-width terminals
-# instead. A 16" MacBook Pro (1728pt) yields 432pt columns and so stacks; a 5K
-# display (2560pt) yields 640pt columns and so grids.
-if [[ "$layout" == "auto" ]]; then
-  if (( VW / 4 >= minCol )); then layout="grid"; else layout="stacked"; fi
-fi
-
-# Terminal boxes over the right half, in creation order: a flat run of
-# {left top right bottom} integers, four per window, passed straight to osascript.
-if [[ "$layout" == "grid" ]]; then
-  #   TL              TR
-  #   BL              BR
-  boxes=(
-    "$xHalf"    "$yTop"  "$xColMid"  "$yMid"
-    "$xColMid"  "$yTop"  "$xRight"   "$yMid"
-    "$xHalf"    "$yMid"  "$xColMid"  "$yBottom"
-    "$xColMid"  "$yMid"  "$xRight"   "$yBottom"
-  )
-else
-  #   TOP
-  #   BOTTOM
-  boxes=(
-    "$xHalf"  "$yTop"  "$xRight"  "$yMid"
-    "$xHalf"  "$yMid"  "$xRight"  "$yBottom"
-  )
-fi
-termCount=$(( ${#boxes[@]} / 4 ))
-
-# ---------------------------------------------------------------------------
-# 3. Launch VS Code (new window) on the folder.
-#
-#    VS Code unavoidably *activates* itself when it opens a window — there is no
-#    background/no-activate path that also forces a new window. If VS Code's
-#    only existing windows live on another Space and macOS's "auto-swoosh"
-#    Mission Control setting is on, this can pull you to that other desktop.
-#    See the README for details; this script no longer touches that setting.
-#
-#    First snapshot the titles of any existing VS Code windows, so step 5 can
-#    tile the window we just opened and never a pre-existing one (the same
-#    "diff to touch only what we created" guarantee the Terminal step gets from
-#    window ids).
-vscodeBefore="$(osascript -e 'tell application "System Events"
-  if exists process "Code" then
-    set AppleScript'"'"'s text item delimiters to linefeed
-    return (name of every window of process "Code") as text
-  end if
-  return ""
-end tell' 2>/dev/null || true)"
-
-VSCODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
-if [[ -x "$VSCODE_BIN" ]]; then
-  "$VSCODE_BIN" -n "$folder" >/dev/null 2>&1 || open -a "Visual Studio Code" "$folder"
-else
-  open -a "Visual Studio Code" "$folder"
-fi
-
-# ---------------------------------------------------------------------------
-# 4. Open the Terminal windows and tile them into the right half.
-#    Uses Terminal's own scripting (no Accessibility permission needed).
-#    Arguments to the AppleScript: folder, plugin dir, then N boxes of 4 numbers.
-# ---------------------------------------------------------------------------
-termData="$(osascript - "$folder" "$pluginDir" "${boxes[@]}" <<'APPLESCRIPT'
-on run argv
-    set theFolder to item 1 of argv
-    set thePlugin to item 2 of argv
-
-    -- Everything after the folder and plugin args is a flat run of boxes,
-    -- four integers each, so the window count follows from argv's length.
-    set boxCount to ((count of argv) - 2) div 4
-
-    -- Optional `--plugin-dir <dir>` argument.
-    set pluginArg to ""
-    if thePlugin is not "" then
-        set pluginArg to " --plugin-dir " & quoted form of thePlugin
-    end if
-    set claudeArgs to "--dangerously-skip-permissions" & pluginArg
-
-    -- Build the command each terminal runs. Prefer `claude` on PATH,
-    -- fall back to the known install location under ~/.local/bin. Each session
-    -- runs under `caffeinate -i` so the Mac stays awake for as long as that
-    -- terminal's Claude session is running (the assertion is released the moment
-    -- the command exits).
-    set cmd to "cd " & quoted form of theFolder & " && " & ¬
-        "{ command -v claude >/dev/null 2>&1 && caffeinate -i claude " & claudeArgs & "; } || " & ¬
-        "caffeinate -i \"$HOME/.local/bin/claude\" " & claudeArgs
-
-    -- Boxes start at argv item 3, four numbers each.
-    -- No `activate`: `do script` opens each new window on the *current* Space,
-    -- while activating could jump to a Space where Terminal already has windows.
-    -- Diff window IDs around each `do script` so we tile the window we just
-    -- created, never a pre-existing Terminal window. Collect "id|tty" for each
-    -- created window so the launcher can record them for a later clean close.
-    set winRecs to {}
-    tell application "Terminal"
-        repeat with b from 0 to (boxCount - 1)
-            set base to 3 + (b * 4)
-            set L to (item base of argv) as integer
-            set T to (item (base + 1) of argv) as integer
-            set R to (item (base + 2) of argv) as integer
-            set Bo to (item (base + 3) of argv) as integer
-            set oldIDs to id of every window
-            do script cmd
-            delay 0.2
-            set newWin to missing value
-            repeat with w in windows
-                if (id of w) is not in oldIDs then
-                    set newWin to w
-                    exit repeat
-                end if
-            end repeat
-            if newWin is missing value then set newWin to front window
-            set bounds of newWin to {L, T, R, Bo}
-            set winTTY to ""
-            try
-                set winTTY to tty of selected tab of newWin
-            end try
-            set end of winRecs to ((id of newWin) as text) & "|" & winTTY
-        end repeat
-    end tell
-    set AppleScript's text item delimiters to ","
-    return winRecs as text
-end run
-APPLESCRIPT
-)"
-
-# ---------------------------------------------------------------------------
-# 5. Position the VS Code window into the left half.
-#    This drives another process via System Events, which needs Accessibility
-#    permission for the app running this script (usually Terminal). Wrapped in
-#    `try` so a missing permission never aborts the (already tiled) terminals.
-# ---------------------------------------------------------------------------
-osascript - "$vsX" "$vsY" "$vsW" "$vsH" "$folderName" "${vscodeBefore:-}" <<'APPLESCRIPT' 2>/dev/null || true
-on run argv
-    set px to (item 1 of argv) as integer
-    set py to (item 2 of argv) as integer
-    set pw to (item 3 of argv) as integer
-    set ph to (item 4 of argv) as integer
-    set folderName to (item 5 of argv)
-
-    -- Titles of the VS Code windows that existed *before* step 3 opened ours,
-    -- one per line. Anything matching the folder that is NOT in this list is
-    -- the window we just created; anything in it is pre-existing and untouched.
-    set AppleScript's text item delimiters to linefeed
-    set beforeList to text items of (item 6 of argv)
-    set AppleScript's text item delimiters to ""
-
-    try
-        tell application "System Events" to tell process "Code"
-            -- Wait up to ~6s for the window we opened to appear. Prefer a window
-            -- whose title contains the folder name AND was not open before, so
-            -- we never grab (and resize) a pre-existing same-folder window.
-            set target to missing value
-            set waited to 0
-            repeat
-                repeat with w in windows
-                    set nm to name of w
-                    if (nm contains folderName) and (beforeList does not contain nm) then
-                        set target to w
-                        exit repeat
-                    end if
-                end repeat
-                if target is not missing value then exit repeat
-                delay 0.2
-                set waited to waited + 0.2
-                if waited > 6 then exit repeat
-            end repeat
-            -- Fallbacks: any window matching the folder, then the front window.
-            if target is missing value then
-                repeat with w in windows
-                    if (name of w) contains folderName then
-                        set target to w
-                        exit repeat
-                    end if
-                end repeat
-            end if
-            if target is missing value then
-                if (exists window 1) then set target to window 1
-            end if
-            if target is not missing value then
-                set position of target to {px, py}
-                set size of target to {pw, ph}
-            end if
-        end tell
-    end try
-end run
-APPLESCRIPT
-
-# ---------------------------------------------------------------------------
-# 6. Record the windows this launch created so `claude-launcher-close` can
-#    later close exactly those (and only those). Parse "id|tty,id|tty,..."
-#    from the Terminal step into parallel id / tty lists.
-# ---------------------------------------------------------------------------
-term_ids=""
-term_ttys=""
-IFS=',' read -ra _recs <<< "${termData:-}"
-for rec in "${_recs[@]}"; do
-  [[ -z "$rec" ]] && continue
-  term_ids+="${rec%%|*} "
-  tty="${rec#*|}"
-  [[ -n "$tty" ]] && term_ttys+="$tty "
+# Locate launcher-common.sh next to this script, following any symlinks (the
+# script is normally symlinked onto PATH from ~/.local/bin).
+_src="${BASH_SOURCE[0]}"
+while [[ -h "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
 done
+_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+# shellcheck source=launcher-common.sh
+source "$_dir/launcher-common.sh"
 
-mkdir -p "$STATE_DIR/sessions"
-sid="$(date +%Y%m%d-%H%M%S)-$$"
-sfile="$STATE_DIR/sessions/$sid.session"
-{
-  echo "session=$sid"
-  echo "created_at=$(date +%s)"
-  echo "folder=$folder"
-  echo "layout=$layout"
-  echo "vscode_title=$folderName"
-  echo "terminal_ids=$(echo "$term_ids" | xargs)"
-  echo "terminal_ttys=$(echo "$term_ttys" | xargs)"
-} > "$sfile"
-ln -sf "$sfile" "$STATE_DIR/last.session"
+LAUNCHER_NAME="claude-launcher"
+LAUNCHER_ENV_PREFIX="CLAUDE_LAUNCHER"
+LAUNCHER_USAGE="Usage: claude-launcher [folder] [plugin-dir]   (folder defaults to the current directory)"
+LAUNCHER_RECORD="1"   # record each launch so `claude-launcher-close` can tear it down
 
-echo "claude-launcher: launched in $folder (session $sid, $termCount terminals, $layout layout)"
-echo "  close it later with:  claude-launcher-close"
+# launcher_build_command <folder> [plugin-dir]
+#   Command each terminal runs after cd'ing into <folder>. Prefer `claude` on
+#   PATH, fall back to the known install location under ~/.local/bin. Each
+#   session runs under `caffeinate -i` so the Mac stays awake for as long as
+#   that terminal's Claude session is running (the assertion is released the
+#   moment the command exits). An optional plugin dir is passed via
+#   `--plugin-dir`.
+launcher_build_command() {
+  local folder="$1"
+  local pluginDir="${2:-}"
+
+  if [[ -n "$pluginDir" ]]; then
+    if [[ ! -d "$pluginDir" ]]; then
+      echo "claude-launcher: plugin directory '$pluginDir' is not a directory" >&2
+      echo "$LAUNCHER_USAGE" >&2
+      exit 1
+    fi
+    pluginDir="$(cd "$pluginDir" && pwd)"
+  fi
+
+  local claudeArgs="--dangerously-skip-permissions"
+  [[ -n "$pluginDir" ]] && claudeArgs+=" --plugin-dir $(printf '%q' "$pluginDir")"
+
+  printf '%s' \
+    "{ command -v claude >/dev/null 2>&1 && caffeinate -i claude $claudeArgs; } || caffeinate -i \"\$HOME/.local/bin/claude\" $claudeArgs"
+}
+
+launcher_main "$@"

@@ -1,9 +1,20 @@
-# claude-launcher
+# claude-launcher / copilot-launcher
 
 Instantly set up a coding layout on macOS: **VS Code on the left half** and **Terminal.app windows
-on the right**, each running a Claude Code session in a target folder. Everything is scaffolded on
-the **current Space** (virtual desktop), and `claude-launcher-close` tears the whole layout back
-down again.
+on the right**, each running an AI coding CLI in a target folder. Everything is scaffolded on the
+**current Space** (virtual desktop), and `claude-launcher-close` tears the whole layout back down
+again.
+
+There are two launchers, sharing one engine:
+
+- **`claude-launcher`** — each terminal runs a **Claude Code** session
+  (`claude --dangerously-skip-permissions`). Records each launch so
+  `claude-launcher-close` can tear it down later.
+- **`copilot-launcher`** — each terminal runs a **GitHub Copilot CLI** session
+  (`copilot --allow-all-tools`). No close command — close the windows yourself when done.
+
+Both do the exact same tiling; they differ only in which CLI the terminals run. That single
+difference is all that lives in each launcher — see [Architecture](#architecture) below.
 
 On a wide display the right half is a 2×2 grid of four terminals:
 
@@ -48,6 +59,9 @@ CLAUDE_LAUNCHER_LAYOUT=stacked claude-launcher ~/code/project   # two terminals,
 CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # four terminals, even on a laptop
 ```
 
+Each launcher reads its own env namespace, so `copilot-launcher` uses `COPILOT_LAUNCHER_LAYOUT` and
+`COPILOT_LAUNCHER_MIN_COL` with the same meanings.
+
 ### No browser pane
 
 Earlier versions tried to tile a browser window on the far left. It was removed because macOS makes
@@ -74,16 +88,43 @@ Space, will open on the current desktop if you want to add one by hand.
 ## Usage
 
 ```sh
-claude-launcher [folder] [plugin-dir]      # open the layout
-claude-launcher-close                       # close the most recent layout
+claude-launcher  [folder] [plugin-dir]      # open the layout, terminals run Claude Code
+claude-launcher-close                       # close the most recent Claude layout
+
+copilot-launcher [folder]                   # open the layout, terminals run the Copilot CLI
 ```
 
 - `folder` — the directory to open VS Code and the terminals in. Defaults to the current
   directory if omitted.
-- `plugin-dir` — optional Claude Code plugin directory. When given, each session is started with
-  `claude --plugin-dir <plugin-dir>` so the plugin is loaded.
+- `plugin-dir` *(claude-launcher only)* — optional Claude Code plugin directory. When given, each
+  session is started with `claude --plugin-dir <plugin-dir>` so the plugin is loaded.
 
-Each terminal runs `claude --dangerously-skip-permissions [--plugin-dir <plugin-dir>]` in that folder.
+Each terminal runs, in that folder:
+
+- `claude-launcher`  → `claude --dangerously-skip-permissions [--plugin-dir <plugin-dir>]`
+- `copilot-launcher` → `copilot --allow-all-tools`
+
+`--allow-all-tools` is the Copilot analog of Claude Code's `--dangerously-skip-permissions`: it
+auto-approves tool use for the session. `copilot-launcher` needs the [GitHub Copilot
+CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli) on your `PATH`
+(`npm install -g @github/copilot`); if it isn't found, the terminal prints an install hint and
+drops into a normal shell.
+
+## Architecture
+
+The tiling engine — screen measurement, VS Code launch/positioning, Terminal.app creation and
+placement, and (optionally) session recording — lives once in **`launcher-common.sh`**. Each
+launcher is a thin wrapper that sources it and supplies only the CLI-specific bits:
+
+| File | Role |
+| --- | --- |
+| `launcher-common.sh` | Shared engine. Sourced, never run directly. |
+| `claude-launcher` | Sets name/env-prefix + a `launcher_build_command` hook that runs Claude Code; records launches (`LAUNCHER_RECORD=1`). |
+| `copilot-launcher` | Same, but its hook runs the Copilot CLI; no recording (`LAUNCHER_RECORD=0`), no close command. |
+| `claude-launcher-close` | Tears down a recorded Claude launch (see below). |
+
+To add another CLI, copy a wrapper, change `LAUNCHER_NAME`, `LAUNCHER_ENV_PREFIX`, and the one
+`launcher_build_command` function — nothing else.
 
 ## Closing a layout
 
@@ -120,15 +161,18 @@ launch).
 
 ## Install
 
-The scripts are self-contained. Make them executable and symlink them onto your `PATH`:
+Make the launchers executable and symlink them onto your `PATH`:
 
 ```sh
-chmod +x claude-launcher claude-launcher-close
+chmod +x claude-launcher copilot-launcher claude-launcher-close
 ln -sf "$PWD/claude-launcher"       ~/.local/bin/claude-launcher
+ln -sf "$PWD/copilot-launcher"      ~/.local/bin/copilot-launcher
 ln -sf "$PWD/claude-launcher-close" ~/.local/bin/claude-launcher-close
 ```
 
-(`~/.local/bin` is already on your `PATH`.)
+(`~/.local/bin` is already on your `PATH`.) You do **not** symlink `launcher-common.sh` — each
+launcher resolves its own symlink and sources the library from wherever the real script lives, so
+keep `launcher-common.sh` sitting next to `claude-launcher` and `copilot-launcher` in this repo.
 
 ## One-time permission: Accessibility
 

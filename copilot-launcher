@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# copilot-launcher — tile VS Code + Terminal.app windows on the current Space,
+# with each terminal running a GitHub Copilot CLI session in the target folder.
+# The Copilot counterpart to `claude-launcher`.
+#
+# All the tiling/VS Code work lives in launcher-common.sh; this file only pins
+# the Copilot command each terminal runs. There is deliberately no companion
+# `copilot-launcher-close`: launches are not recorded, so close the windows
+# yourself when you're done.
+#
+# Usage:
+#   copilot-launcher [folder]
+#     folder  defaults to the current directory
+#
+# Environment:
+#   COPILOT_LAUNCHER_LAYOUT   auto (default) | grid | stacked
+#   COPILOT_LAUNCHER_MIN_COL  minimum terminal width, in points, that `auto`
+#                             requires before it chooses the grid (default 640)
+set -euo pipefail
+
+# Locate launcher-common.sh next to this script, following any symlinks (the
+# script is normally symlinked onto PATH from ~/.local/bin).
+_src="${BASH_SOURCE[0]}"
+while [[ -h "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+# shellcheck source=launcher-common.sh
+source "$_dir/launcher-common.sh"
+
+LAUNCHER_NAME="copilot-launcher"
+LAUNCHER_ENV_PREFIX="COPILOT_LAUNCHER"
+LAUNCHER_USAGE="Usage: copilot-launcher [folder]   (folder defaults to the current directory)"
+LAUNCHER_RECORD="0"   # not recorded — there is no companion close command
+
+# launcher_build_command <folder>
+#   Command each terminal runs after cd'ing into <folder>. Starts an interactive
+#   Copilot CLI session with `--allow-all-tools` (the Copilot analog to Claude's
+#   `--dangerously-skip-permissions`, auto-approving tool use). Each session runs
+#   under `caffeinate -i` so the Mac stays awake for as long as that terminal's
+#   Copilot session is running. If `copilot` isn't on PATH, print a hint and drop
+#   into a normal shell rather than leaving a bare "command not found".
+launcher_build_command() {
+  local copilotArgs="--allow-all-tools"
+
+  printf '%s' \
+    "{ command -v copilot >/dev/null 2>&1 && caffeinate -i copilot $copilotArgs; } || { echo 'copilot-launcher: the Copilot CLI (\`copilot\`) was not found on PATH — install it with: npm install -g @github/copilot'; exec \"\$SHELL\"; }"
+}
+
+launcher_main "$@"
