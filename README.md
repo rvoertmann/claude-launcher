@@ -11,7 +11,7 @@ There are two launchers, sharing one engine:
   (`claude --dangerously-skip-permissions`). Records each launch so
   `claude-launcher-close` can tear it down later.
 - **`copilot-launcher`** — each terminal runs a **GitHub Copilot CLI** session
-  (`copilot --allow-all-tools`). No close command — close the windows yourself when done.
+  (`copilot --allow-all --autopilot`). No close command — close the windows yourself when done.
 
 Both do the exact same tiling; they differ only in which CLI the terminals run. That single
 difference is all that lives in each launcher — see [Architecture](#architecture) below.
@@ -102,10 +102,11 @@ copilot-launcher [folder]                   # open the layout, terminals run the
 Each terminal runs, in that folder:
 
 - `claude-launcher`  → `claude --dangerously-skip-permissions [--plugin-dir <plugin-dir>]`
-- `copilot-launcher` → `copilot --allow-all-tools`
+- `copilot-launcher` → `copilot --allow-all --autopilot`
 
-`--allow-all-tools` is the Copilot analog of Claude Code's `--dangerously-skip-permissions`: it
-auto-approves tool use for the session. `copilot-launcher` needs the [GitHub Copilot
+`--allow-all` is the Copilot analog of Claude Code's `--dangerously-skip-permissions`: it
+auto-approves tools, paths, and URLs for the session. `--autopilot` starts the session in
+autopilot mode. `copilot-launcher` needs the [GitHub Copilot
 CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli) on your `PATH`
 (`npm install -g @github/copilot`); if it isn't found, the terminal prints an install hint and
 drops into a normal shell.

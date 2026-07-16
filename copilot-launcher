@@ -38,13 +38,14 @@ LAUNCHER_RECORD="0"   # not recorded — there is no companion close command
 
 # launcher_build_command <folder>
 #   Command each terminal runs after cd'ing into <folder>. Starts an interactive
-#   Copilot CLI session with `--allow-all-tools` (the Copilot analog to Claude's
-#   `--dangerously-skip-permissions`, auto-approving tool use). Each session runs
+#   Copilot CLI session with `--allow-all` (the Copilot analog to Claude's
+#   `--dangerously-skip-permissions`, auto-approving tools, paths, and URLs) and
+#   `--autopilot` (starts the session in autopilot mode). Each session runs
 #   under `caffeinate -i` so the Mac stays awake for as long as that terminal's
 #   Copilot session is running. If `copilot` isn't on PATH, print a hint and drop
 #   into a normal shell rather than leaving a bare "command not found".
 launcher_build_command() {
-  local copilotArgs="--allow-all-tools"
+  local copilotArgs="--allow-all --autopilot"
 
   printf '%s' \
     "{ command -v copilot >/dev/null 2>&1 && caffeinate -i copilot $copilotArgs; } || { echo 'copilot-launcher: the Copilot CLI (\`copilot\`) was not found on PATH — install it with: npm install -g @github/copilot'; exec \"\$SHELL\"; }"
