@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # claude-launcher-close — close the windows a `claude-launcher` run created,
-# and only those. Reads the per-launch record written under $STATE_DIR and
-# closes exactly the Terminal / VS Code windows from that session.
+# and only those. Reads the per-launch record written under $STATE_DIR and tears
+# down exactly the tmux sessions, iTerm2 windows/sessions and VS Code window
+# from that launch.
 #
 # Usage:
 #   claude-launcher-close                 # close the most recent session
@@ -12,15 +13,83 @@
 #
 # On "current desktop only": macOS does not expose a window's Space (virtual
 # desktop) to unprivileged scripting, so this cannot *filter* by the desktop you
-# are currently viewing. Instead it targets the exact window IDs each launch
-# recorded — which were all created on one desktop — so it closes precisely that
-# launch's windows and never any pre-existing ones. If you dragged some of those
-# windows to another Space, they will still be closed (they belong to the launch).
+# are currently viewing. Instead it targets the exact ids each launch recorded —
+# which were all created on one desktop — so it closes precisely that launch's
+# windows and never any pre-existing ones. If you dragged some of those windows
+# to another Space, they will still be closed (they belong to the launch).
+#
+# ---------------------------------------------------------------------------
+# Teardown order, and why it is this order
+# ---------------------------------------------------------------------------
+#   1. tmux sessions.  Killing the tmux session is what actually ends the AI
+#      CLI, and it is the CLEAN path: the process gets a real hangup inside its
+#      own terminal rather than being SIGKILLed, and iTerm2 is never asked to
+#      close a window with a live foreground process (which is what raises the
+#      "terminate the running process?" sheet). Doing this first means every
+#      window closed in steps 2-3 holds nothing but an idle login shell.
+#
+#      This REPLACES the `kill -9` over recorded ttys that the Terminal.app
+#      engine used. That was always a loaded gun: a tty is a reusable name, so
+#      /dev/ttys003 recorded weeks ago may today belong to a session the user is
+#      actively working in, and `kill -9` on it would take that session out with
+#      no warning and no recovery. `terminal_ttys` is therefore recorded but
+#      deliberately never acted on here.
+#
+#   2. Mirror panes.  ONLY this launch's panes on the shared overview window —
+#      never the window itself. See the block above close_mirror_sessions.
+#
+#   3. Primary iTerm2 windows.  The launcher owns those windows outright (it
+#      created them), so closing the window rather than its sessions is right.
+#      In the stacked layout one window holds both tabs, which is why the
+#      engine de-duplicates the recorded window ids. A window is only closed
+#      once it has been PROVED still ours, by finding one of the launch's
+#      recorded session guids inside it — a window id is a recyclable integer
+#      and a state file outlives the app that minted it. See close_iterm_windows.
+#
+#   4. VS Code.  Unchanged from the Terminal.app engine.
+#
+# ---------------------------------------------------------------------------
+# iTerm2 scripting traps this file is built around (checked against the 3.6.11
+# scripting dictionary)
+# ---------------------------------------------------------------------------
+#   * THERE IS NO GLOBAL SESSION LOOKUP. `application` declares exactly one
+#     element, `window`. A session is only ever reachable as
+#     `session ... of tab ... of window ...`, so closing a session by its guid
+#     means walking windows -> tabs -> sessions and comparing ids by hand.
+#
+#   * A TAB HAS NO IDENTIFIER — only a mutable `index` and a read/write `title`.
+#     Nothing durable can ever be keyed on a tab, which is why a launch's tab on
+#     the overview window is addressed through the guids of the sessions in it.
+#
+#   * `window id N` IS UNVERIFIED on this version. This file does not use it at
+#     all, not even guarded: iterating `windows` and comparing `id of w` reaches
+#     the same window using only primitives that are known to work (the `window`
+#     element and its integer `id`), so there is nothing left to verify.
+#
+#   * `close` accepts a session, a tab or a window as its direct parameter — all
+#     three classes respond to it.
+#
+#   * `tell application "iTerm2"` LAUNCHES iTerm2 if it is not running. A close
+#     command must never resurrect a quit terminal just to look for windows that
+#     cannot exist, so every tell block below sits behind
+#     `if application "iTerm2" is running`, which is the AppleScript idiom that
+#     tests without launching. (`tell application "System Events" to exists
+#     process "iTerm2"` would do as well, at the cost of an extra permission.)
 #
 set -euo pipefail
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-launcher"
 SESS_DIR="$STATE_DIR/sessions"
+
+# The socket the launcher's tmux server lives on. MUST match `SOCKET` in
+# `claude-launcher-session` and `claude-launcher-mirror`.
+TMUX_SOCKET="claudelauncher"
+
+# Prefer tmux on PATH, fall back to the Homebrew location — the same fallback
+# the session wrapper makes, for the same reason (a GUI-launched shell does not
+# always inherit a PATH with /opt/homebrew/bin on it).
+TMUX_BIN="$(command -v tmux || true)"
+[[ -n "$TMUX_BIN" ]] || TMUX_BIN="/opt/homebrew/bin/tmux"
 
 # --- pick which session file(s) to act on ------------------------------------
 mode="last"
@@ -33,32 +102,59 @@ case "${1:-}" in
   *)      mode="one"; want="$1" ;;
 esac
 
-if [[ ! -d "$SESS_DIR" ]] || [[ -z "$(ls -A "$SESS_DIR" 2>/dev/null)" ]]; then
+# Collect the records up front with nullglob on, so "no .session files" is an
+# empty array rather than a literal `*.session` path that every later step then
+# tries to parse.
+shopt -s nullglob
+all_files=( "$SESS_DIR"/*.session )
+shopt -u nullglob
+
+if [[ ${#all_files[@]} -eq 0 ]]; then
   echo "claude-launcher-close: no recorded sessions"
   exit 0
 fi
 
 # Parse a session file into shell vars WITHOUT sourcing it (values such as the
-# folder path may contain spaces, which `source` would split on).
-session=""; folder=""; vscode_title=""; terminal_ids=""; terminal_ttys=""
+# folder path may contain spaces, which `source` would split on; `IFS='='` plus
+# a two-variable `read` also keeps any `=` inside a value intact, since the
+# trailing fields all land in the last variable).
+#
+# `record_format` is the interesting one: it is "iterm" only when the file
+# carries at least one of the keys the iTerm2 engine introduced, and "terminal"
+# otherwise. See close_session for why an old record is refused rather than
+# translated.
+session=""; folder=""; vscode_title=""; terminal_ids=""
+iterm_session_ids=""; tmux_sessions=""; mirror_window_id=""; mirror_session_ids=""
+record_format="terminal"
 parse_session() {
-  session=""; folder=""; vscode_title=""; terminal_ids=""; terminal_ttys=""
+  session=""; folder=""; vscode_title=""; terminal_ids=""
+  iterm_session_ids=""; tmux_sessions=""; mirror_window_id=""; mirror_session_ids=""
+  record_format="terminal"
   local key val
   while IFS='=' read -r key val; do
     case "$key" in
-      session)       session="$val" ;;
-      folder)        folder="$val" ;;
-      vscode_title)  vscode_title="$val" ;;
-      terminal_ids)  terminal_ids="$val" ;;
-      terminal_ttys) terminal_ttys="$val" ;;
+      session)            session="$val" ;;
+      folder)             folder="$val" ;;
+      vscode_title)       vscode_title="$val" ;;
+      terminal_ids)       terminal_ids="$val" ;;
+      iterm_session_ids)  iterm_session_ids="$val"; record_format="iterm" ;;
+      tmux_sessions)      tmux_sessions="$val";     record_format="iterm" ;;
+      mirror_window_id)   mirror_window_id="$val";  record_format="iterm" ;;
+      mirror_session_ids) mirror_session_ids="$val"; record_format="iterm" ;;
     esac
   done < "$1"
 }
 
 if [[ "$mode" == "list" ]]; then
-  for f in "$SESS_DIR"/*.session; do
+  for f in "${all_files[@]}"; do
     parse_session "$f"
-    printf '%s\t%s\n' "$session" "$folder"
+    if [[ "$record_format" == "iterm" ]]; then
+      printf '%s\t%s\n' "$session" "$folder"
+    else
+      # Third column only for records this build cannot act on, so the normal
+      # two-column output is unchanged.
+      printf '%s\t%s\t(pre-iTerm2 record — cannot be closed)\n' "$session" "$folder"
+    fi
   done
   exit 0
 fi
@@ -66,42 +162,392 @@ fi
 # Build the list of session files to close.
 files=()
 case "$mode" in
-  all)  for f in "$SESS_DIR"/*.session; do files+=("$f"); done ;;
+  all)  files=( "${all_files[@]}" ) ;;
   one)  f="$SESS_DIR/$want.session"
         [[ -f "$f" ]] || { echo "claude-launcher-close: no such session '$want'" >&2; exit 1; }
         files+=("$f") ;;
-  last) # newest by mtime
-        f="$(ls -t "$SESS_DIR"/*.session 2>/dev/null | head -1)"
+  last) # The launcher maintains `last.session` as a symlink to the newest
+        # record; fall back to mtime order if it is missing or dangling.
+        f=""
+        if [[ -L "$STATE_DIR/last.session" ]]; then
+          t="$(readlink "$STATE_DIR/last.session" 2>/dev/null || true)"
+          [[ -n "$t" && -f "$t" ]] && f="$t"
+        fi
+        if [[ -z "$f" ]]; then
+          # `|| true` inside the group, not after the pipe: `head -1` closing the
+          # pipe early kills `ls` with SIGPIPE, and `pipefail` would otherwise
+          # turn that into a fatal status under `set -e`.
+          f="$( { ls -t -- "${all_files[@]}" 2>/dev/null || true; } | head -1 )"
+        fi
         [[ -n "$f" ]] && files+=("$f") ;;
 esac
 
+# ---------------------------------------------------------------------------
+# kill_tmux_sessions <name>...
+#   Kill each recorded tmux session on the launcher's socket.
+#
+#   Mirror BEFORE primary, matching `claude-launcher-session`'s own cleanup and
+#   for the same reason: the two are grouped sessions sharing one window, and a
+#   window lives as long as ANY session links it — so killing the primary while
+#   the mirror still holds the window leaves the window, and the AI CLI running
+#   inside it, alive. (The config's `session-closed` hook reaps the mirror too,
+#   so this is belt and braces; the ordering costs nothing and does not depend
+#   on the hook having fired.)
+#
+#   `=name` forces an EXACT match. tmux would otherwise accept a prefix or
+#   fnmatch match, and `-t cl-...-0` could then resolve to `cl-...-0__mirror`.
+#
+#   Every kill is allowed to fail. The overwhelmingly common case is that the
+#   user already quit the CLI, so the session is long gone — and once the last
+#   session dies, `exit-empty on` takes the whole server with it, after which
+#   these commands report "no server running" instead. Neither is an error.
+#   (`kill-session` is not a server-starting command, so this cannot bring the
+#   server back up; that is also why no `-f <conf>` is passed — the config only
+#   matters to whichever invocation starts the server, which this never is.)
+#
+#   No fallback if tmux is missing: with no tmux binary there is no launcher
+#   tmux server either, so there is nothing to kill.
+# ---------------------------------------------------------------------------
+kill_tmux_sessions() {
+  local s
+  [[ -x "$TMUX_BIN" ]] || {
+    echo "claude-launcher-close: tmux not found; skipping tmux teardown" >&2
+    return 0
+  }
+  for s in "$@"; do
+    [[ -n "$s" ]] || continue
+    "$TMUX_BIN" -L "$TMUX_SOCKET" kill-session -t "=${s}__mirror" 2>/dev/null || true
+    "$TMUX_BIN" -L "$TMUX_SOCKET" kill-session -t "=$s" 2>/dev/null || true
+  done
+}
+
+# ---------------------------------------------------------------------------
+# close_iterm_sessions <session-guid>...
+#   Close individual iTerm2 sessions by guid.
+#
+#   There is no global session lookup (see the header), so each guid is found by
+#   walking windows -> tabs -> sessions. The walk is restarted from scratch for
+#   every guid and abandoned the instant one is closed: AppleScript's `repeat
+#   with x in <elements>` iterates positionally, so continuing to step through a
+#   collection that a `close` has just renumbered would read the wrong objects.
+#   One fresh scan per guid is O(windows x guids) on a handful of each, and it
+#   never touches a stale reference.
+#
+#   Closing a pane collapses its tab when it was the tab's last pane, and the
+#   window when that was the window's last tab — which is exactly how a launch's
+#   tab is removed from the shared overview window without closing the window.
+#
+#   Every id comparison is wrapped in `try`: a window can be torn down by the
+#   user (or by an earlier step here) between the enumeration and the property
+#   read, and that must skip the window, not abort the teardown.
+# ---------------------------------------------------------------------------
+close_iterm_sessions() {
+  [[ $# -gt 0 ]] || return 0
+  osascript - "$@" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+    -- Never launch iTerm2 just to close things in it.
+    if not (application "iTerm2" is running) then return
+    tell application "iTerm2"
+        repeat with g in argv
+            set wanted to contents of g
+            if wanted is not "" then
+                set closedIt to false
+                try
+                    repeat with w in windows
+                        if closedIt then exit repeat
+                        try
+                            repeat with t in tabs of w
+                                if closedIt then exit repeat
+                                try
+                                    repeat with s in sessions of t
+                                        set thisID to ""
+                                        try
+                                            set thisID to (id of s) as text
+                                        end try
+                                        if thisID is wanted then
+                                            try
+                                                close s
+                                            end try
+                                            set closedIt to true
+                                            exit repeat
+                                        end if
+                                    end repeat
+                                end try
+                            end repeat
+                        end try
+                    end repeat
+                end try
+            end if
+        end repeat
+    end tell
+end run
+APPLESCRIPT
+}
+
+# ---------------------------------------------------------------------------
+# close_iterm_windows <own-session-guids-csv> <window-id>...
+#   Close whole iTerm2 windows by id — but only after PROVING the window is
+#   still ours.
+#
+#   THE HAZARD THIS EXISTS TO CLOSE. A window id is an integer from iTerm2's own
+#   counter, and that counter restarts when iTerm2 does. A state file outlives
+#   the app: quit iTerm2 (or reboot) with a launch's windows still open and the
+#   record survives on disk saying `terminal_ids=17`. iTerm2 comes back, hands
+#   id 17 to an entirely unrelated window, and a later `claude-launcher-close`
+#   would close *that* — someone else's work, with no undo. The Terminal.app
+#   engine had exactly this hole; it is not new, but it is real, and a command
+#   whose whole promise is "closes only what this launch created" must not
+#   have it.
+#
+#   The fix: before closing, walk the window's tabs and sessions and require at
+#   least one session whose guid is in this launch's recorded
+#   `iterm_session_ids`. Session guids are opaque text minted per session and
+#   are never recycled the way an integer counter is, so a match is proof of
+#   ownership. A window that has been renumbered onto someone else's work
+#   matches no guid and is left alone.
+#
+#   Normal teardown always passes this check: closing a launcher window is the
+#   only thing that removes its sessions, and this runs before that. The check
+#   only bites in the cases where it should — restarted iTerm2, restored
+#   sessions, a recycled id.
+#
+#   DEGRADED MODE, stated plainly: if the guid list is empty (a launch where the
+#   AppleScript recorded window ids but no session ids, or any record written
+#   before those keys existed) there is nothing to prove ownership with, and the
+#   window is closed on the id alone — i.e. the old hazard, in the one case
+#   where the safer path has no data to work from. It cannot arise for a record
+#   written by the current engine, which always records both.
+#
+#   Deliberately NOT `close window id N`: that lookup is unverified on this
+#   version, whereas the `window` element and its integer `id` are both plainly
+#   in the dictionary. Scanning for the id costs nothing at this scale and
+#   removes the one unproven call from the teardown path.
+#
+#   Same restart-per-id discipline as close_iterm_sessions: closing a window
+#   renumbers the collection being walked, so each id gets a fresh scan that is
+#   abandoned as soon as its window is found.
+# ---------------------------------------------------------------------------
+close_iterm_windows() {
+  # $1 is the guid list; there must be at least one window id after it.
+  [[ $# -gt 1 ]] || return 0
+  osascript - "$@" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+    if not (application "iTerm2" is running) then return
+
+    -- item 1 is this launch's session guids, comma separated. Empty items (a
+    -- stray leading/trailing comma) are dropped, so an all-empty list reduces
+    -- to "nothing to verify against" rather than to a guid of "".
+    set AppleScript's text item delimiters to ","
+    set rawGuids to text items of (item 1 of argv)
+    set AppleScript's text item delimiters to ""
+    set guidList to {}
+    repeat with g in rawGuids
+        if (contents of g) is not "" then set end of guidList to (contents of g)
+    end repeat
+    set mustVerify to ((count of guidList) > 0)
+
+    tell application "iTerm2"
+        repeat with idx from 2 to (count of argv)
+            set wanted to item idx of argv
+            if wanted is not "" then
+                set foundIt to false
+                try
+                    repeat with w in windows
+                        set thisID to ""
+                        try
+                            set thisID to (id of w) as text
+                        end try
+                        if thisID is wanted then
+                            -- Ownership proof (see the comment above). With no
+                            -- guids to check against, fall back to the id alone.
+                            set isOurs to (not mustVerify)
+                            if mustVerify then
+                                try
+                                    repeat with t in tabs of w
+                                        if isOurs then exit repeat
+                                        try
+                                            repeat with s in sessions of t
+                                                set sid to ""
+                                                try
+                                                    set sid to (id of s) as text
+                                                end try
+                                                if guidList contains sid then
+                                                    set isOurs to true
+                                                    exit repeat
+                                                end if
+                                            end repeat
+                                        end try
+                                    end repeat
+                                end try
+                            end if
+                            if isOurs then
+                                try
+                                    close w
+                                end try
+                            end if
+                            set foundIt to true
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+            end if
+        end repeat
+    end tell
+end run
+APPLESCRIPT
+}
+
+# ---------------------------------------------------------------------------
+# iterm_window_exists <window-id>
+#   Echo "yes" / "no", or nothing at all if the question could not be answered.
+#   The caller MUST treat "no answer" as "assume it still exists" — see
+#   prune_overview_pointer.
+# ---------------------------------------------------------------------------
+iterm_window_exists() {
+  osascript - "$1" 2>/dev/null <<'APPLESCRIPT' || true
+on run argv
+    set wanted to item 1 of argv
+    -- iTerm2 not running means the window is certainly gone.
+    if not (application "iTerm2" is running) then return "no"
+    set found to false
+    tell application "iTerm2"
+        try
+            repeat with w in windows
+                set thisID to ""
+                try
+                    set thisID to (id of w) as text
+                end try
+                if thisID is wanted then
+                    set found to true
+                    exit repeat
+                end if
+            end repeat
+        end try
+    end tell
+    if found then
+        return "yes"
+    else
+        return "no"
+    end if
+end run
+APPLESCRIPT
+}
+
+# ---------------------------------------------------------------------------
+# prune_overview_pointer
+#   $STATE_DIR/overview is a launcher-GLOBAL singleton: the id of the shared
+#   overview (mirror) window, so the next launch appends a tab to the window
+#   that is already there instead of opening a second one.
+#
+#   It must therefore NOT be deleted merely because this launch is gone — other
+#   projects' tabs may still be in that window, and deleting the pointer would
+#   strand them behind a second overview window on a second Space.
+#
+#   So the pointer is dropped only when the window it names has actually
+#   disappeared, which is what happens once the last tab in it closes. The check
+#   asks iTerm2 about the id RECORDED IN THE POINTER FILE, not the one in the
+#   session record: the two differ whenever the user closed the overview window
+#   between launches and the launcher made a new one, and it is the pointer's
+#   own validity that is in question.
+#
+#   Fail-safe on an unclear answer: keep the file. A stale pointer costs
+#   nothing (the launcher already checks `exists` before reusing it and falls
+#   back to creating a window), whereas deleting a live one produces a duplicate
+#   overview window on a duplicate Space.
+# ---------------------------------------------------------------------------
+prune_overview_pointer() {
+  local ovFile="$STATE_DIR/overview" ov ans
+  [[ -r "$ovFile" ]] || return 0
+  # `$(cat ...)` already strips the trailing newline the launcher wrote.
+  ov="$(cat "$ovFile" 2>/dev/null || true)"
+  # A corrupted pointer is not something to interrogate iTerm2 about; the
+  # launcher rejects a non-integer id anyway, so just clear it.
+  if [[ ! "$ov" =~ ^[0-9]+$ ]]; then
+    rm -f "$ovFile"
+    return 0
+  fi
+  ans="$(iterm_window_exists "$ov")"
+  [[ "$ans" == "no" ]] && rm -f "$ovFile"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# close_session <state-file>
+# ---------------------------------------------------------------------------
 close_session() {
   local file="$1"
   parse_session "$file"
 
+  # -- Records written by the Terminal.app engine ----------------------------
+  #
+  # Such a record predates the iTerm2 migration and CANNOT be honoured, in
+  # either half:
+  #
+  #   * `terminal_ids` holds Terminal.app window ids. Both apps number windows
+  #     with small integers from their own private counter, so id 3 from
+  #     Terminal is very likely to also name a live iTerm2 window — belonging to
+  #     someone else's work. Replaying those ids against iTerm2 would close a
+  #     window this launcher never created, which is the one thing this command
+  #     exists to guarantee it never does.
+  #
+  #   * `terminal_ttys` is worse: ttys are recycled, so the numbers recorded
+  #     then may today address a session the user is working in, and the old
+  #     teardown's `kill -9` gives no second chance.
+  #
+  # The VS Code half is skipped for the same class of reason — it matches by
+  # folder, so on a folder that has since been relaunched it would close the
+  # CURRENT window, and its "Don't Save" handling discards unsaved edits.
+  #
+  # So: close nothing, say so plainly, and drop the unusable record. Dropping it
+  # rather than leaving it is deliberate — kept, it would be picked as "the most
+  # recent session" forever and every plain `claude-launcher-close` would do
+  # nothing at all. Any Terminal.app windows still standing are the user's to
+  # close, and closing a window by hand is cheap; closing the wrong one is not.
+  if [[ "$record_format" != "iterm" ]]; then
+    echo "claude-launcher-close: session ${session:-?} ($folder) predates the iTerm2 migration"
+    echo "  Its window ids name Terminal.app windows and its ttys may since have been"
+    echo "  reassigned, so neither can be replayed safely. Nothing was closed; close any"
+    echo "  leftover windows by hand. Discarding the record."
+    rm -f "$file"
+    if [[ "$(readlink "$STATE_DIR/last.session" 2>/dev/null)" == "$file" ]]; then
+      rm -f "$STATE_DIR/last.session"
+    fi
+    return 0
+  fi
+
   echo "closing session ${session:-?} ($folder)"
 
-  # Terminals: kill the shell on each recorded tty first (so no "terminate the
-  # Terminals: force-quit each session by SIGKILL-ing every process on its
-  # recorded tty (claude + the shell), so there is no "terminate the running
-  # process?" prompt and nothing lingers; then close the window by its id.
-  # (`pkill -t` is unreliable on macOS; enumerate PIDs with `ps -t` instead.)
-  for t in ${terminal_ttys:-}; do
-    pids="$(ps -t "${t#/dev/}" -o pid= 2>/dev/null || true)"
-    [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
-  done
-  # Then close each window by its recorded id. (Terminal takes a couple of
-  # seconds to actually remove a window after its shell dies — that lag is
-  # cosmetic; the window does close. No retry/escalation needed.)
-  for id in ${terminal_ids:-}; do
-    osascript -e "tell application \"Terminal\"
-  try
-    close (every window whose id is ${id})
-  end try
-end tell" >/dev/null 2>&1 || true
-  done
+  # 1. tmux first — the clean kill (see the header).
+  kill_tmux_sessions ${tmux_sessions:-}
 
-  # VS Code has no scriptable window id, so identify our window by its FULL
+  # 2. This launch's panes on the shared overview window, and ONLY those. The
+  #    window itself is never closed: it is shared with every other project's
+  #    launch, and the user's rule is that closing one launch leaves the others
+  #    alone. Closing the panes collapses this launch's tab and, if it was the
+  #    last tab, iTerm2 closes the window by itself.
+  #
+  #    Killing the tmux session above already ended `claude-launcher-mirror`,
+  #    but that only returns the pane to its login shell — the pane, and hence
+  #    the tab, stays until closed here.
+  close_iterm_sessions ${mirror_session_ids:-}
+
+  # 3. The launch's own iTerm2 windows. The launcher created them and nothing
+  #    else lives in them, so the whole window goes rather than its sessions.
+  #    (Stacked layout: one window holding both tabs, already de-duplicated when
+  #    recorded.) The guid list is passed as proof of ownership — see the long
+  #    comment on close_iterm_windows for the recycled-window-id hazard it
+  #    exists to shut. `tr -s` collapses the space-separated list into the csv
+  #    that AppleScript splits on; a guid cannot contain a space or a comma.
+  close_iterm_windows "$(printf '%s' "${iterm_session_ids:-}" | tr -s ' ' ',')" ${terminal_ids:-}
+
+  # 4. Fallback for a window id that no longer resolves — the window was
+  #    renumbered, never recorded, or iTerm2 was restarted with session
+  #    restoration. Session guids are unique text and are never reused, so
+  #    replaying them can only ever hit this launch's own sessions. Normally a
+  #    no-op, because step 3 already took the whole window.
+  close_iterm_sessions ${iterm_session_ids:-}
+
+  # 5. VS Code has no scriptable window id, so identify our window by its FULL
   # folder path: the window whose open document (AXDocument, a file:// URL) sits
   # inside the launched folder is unambiguously ours. Only if no file is open
   # (fresh window, empty AXDocument) do we fall back to the basename title.
@@ -178,3 +624,8 @@ fi
 for f in "${files[@]}"; do
   close_session "$f"
 done
+
+# Once, after everything is closed: forget the overview window only if it is
+# genuinely gone. Deliberately outside the loop — with `--all` the window can
+# only disappear after the LAST launch's tab has been removed.
+prune_overview_pointer

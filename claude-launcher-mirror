@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# claude-launcher-mirror — show a read-only live mirror of a launcher session.
+#
+# Run one of these per pane on the overview desktop to watch every Claude Code
+# session at once. The mirror is a genuine second tmux client, so it updates
+# live rather than polling, but it can neither type into the session nor resize
+# it:
+#
+#   read-only    every key the client sends is dropped by the server, so a
+#                stray keystroke on the overview desktop cannot touch the
+#                user's real session.
+#   ignore-size  the client is excluded from window size calculations, so a
+#                small mirror pane cannot clamp the user's full-size session
+#                down to its own dimensions.
+#
+# (`attach-session -r` is exactly the pair above; they are spelled out here so
+# it is obvious that BOTH properties are load-bearing.)
+#
+# The mirror lives in its own session, `<name>__mirror`, grouped with the
+# primary via `new-session -t`. Sessions in a group share windows but keep
+# their own clients, current window and options — which is what lets the mirror
+# come and go without disturbing the session it is watching.
+#
+# The mirror deliberately owns nothing. It is `claude-launcher-session` that
+# kills both sessions when the real window closes; detaching or killing a
+# mirror never affects the primary.
+#
+# Usage:
+#   claude-launcher-mirror <session-name>
+set -euo pipefail
+
+readonly SOCKET="claudelauncher"
+
+# Locate the tmux config next to this script, following any symlinks.
+_src="${BASH_SOURCE[0]}"
+while [[ -h "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+readonly CONF="$_dir/tmux/claude-launcher.tmux.conf"
+
+TMUX_BIN="$(command -v tmux || true)"
+[[ -n "$TMUX_BIN" ]] || TMUX_BIN="/opt/homebrew/bin/tmux"
+readonly TMUX_BIN
+
+if [[ $# -ne 1 ]]; then
+  printf 'Usage: claude-launcher-mirror <session-name>\n' >&2
+  exit 64
+fi
+if [[ ! -x "$TMUX_BIN" ]]; then
+  printf 'claude-launcher-mirror: tmux not found\n' >&2
+  exit 69
+fi
+
+session="$1"
+mirror="${session}__mirror"
+
+# `=name` forces an exact match; a bare `-t claude-1` would also match
+# `claude-1__mirror`.
+tmux_cmd() {
+  "$TMUX_BIN" -L "$SOCKET" -f "$CONF" "$@"
+}
+
+# Nothing to mirror: no server, or no such session. Say so and stop — a mirror
+# pane must never hang, and must never be the thing that starts the server.
+if ! tmux_cmd has-session -t "=$session" 2>/dev/null; then
+  printf 'No session %s to mirror.\n' "$session"
+  exit 0
+fi
+
+if tmux_cmd has-session -t "=$mirror" 2>/dev/null; then
+  # A mirror session is already there (an earlier mirror pane was closed, or
+  # another pane is watching the same session). Reuse it: grouped sessions
+  # happily carry several clients, and re-creating it would fail on the name.
+  exec "$TMUX_BIN" -L "$SOCKET" attach-session -f read-only,ignore-size -t "=$mirror"
+fi
+
+# Create the grouped session ALREADY ATTACHED, with the client flags applied at
+# creation time (`new-session -f` takes the same flags as `attach-session -f`).
+#
+# It has to be one step. The obvious `new-session -d` followed by
+# `attach-session` does not work here and is not a race that can be tightened:
+# `destroy-unattached on` (see the config) reaps a session the moment any
+# client disconnects from the server, and it fires between the two commands
+# even when they are queued in a single tmux invocation. Measured, not assumed
+# — that spelling reliably fails with "no such session: =<name>__mirror".
+#
+# `bell-action none` trails the attach so the mirror does not re-ring every
+# bell the primary produces: the bell is the launcher's notification channel
+# and belongs to the user's real window, not to a watch-only pane on another
+# desktop. It is queued behind new-session, which has by then created the
+# session and attached this client.
+#
+# The `=<name>:` target spelling is not decoration. set-option resolves -t as a
+# target-PANE and derives the session from it, so a bare `=<name>` is rejected
+# outright ("no such session"); the trailing colon makes it a window target,
+# from which tmux takes the session — and it takes the one that was NAMED, not
+# some other member of the group sharing that window (verified: the primary's
+# bell-action is left untouched).
+exec "$TMUX_BIN" -L "$SOCKET" -f "$CONF" \
+  new-session -t "$session" -s "$mirror" -f read-only,ignore-size \; \
+  set-option -t "=$mirror:" bell-action none
