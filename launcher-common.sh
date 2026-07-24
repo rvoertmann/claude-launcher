@@ -570,10 +570,14 @@ APPLESCRIPT
   # -------------------------------------------------------------------------
   # 5. Position the VS Code window into the left half.
   #    This drives another process via System Events, which needs Accessibility
-  #    permission for the app running this script. Wrapped in `try` so a missing
-  #    permission never aborts the (already tiled) sessions.
+  #    permission for the app running this script (the terminal you launch it
+  #    from — Terminal or iTerm2). The AppleScript's own `try` only guards the
+  #    window lookup/move, so a missing permission never aborts the (already
+  #    tiled) sessions; we still capture stderr here so we can tell the user
+  #    *why* VS Code wasn't moved instead of leaving it looking silently broken.
   # -------------------------------------------------------------------------
-  osascript - "$vsX" "$vsY" "$vsW" "$vsH" "$folderName" "${vscodeBefore:-}" <<'APPLESCRIPT' 2>/dev/null || true
+  local vscodePositionErr
+  vscodePositionErr="$(osascript - "$vsX" "$vsY" "$vsW" "$vsH" "$folderName" "${vscodeBefore:-}" <<'APPLESCRIPT' 2>&1 || true
 on run argv
     set px to (item 1 of argv) as integer
     set py to (item 2 of argv) as integer
@@ -628,6 +632,20 @@ on run argv
     end try
 end run
 APPLESCRIPT
+)"
+
+  # A bare "not allowed assistive access" means the app running this script
+  # (usually Terminal.app) lacks Accessibility permission, so the whole `tell
+  # process "Code"` block above never ran — VS Code opened but was never
+  # moved/resized. Surface that clearly instead of leaving it looking broken
+  # with no explanation.
+  if [[ "$vscodePositionErr" == *"not allowed assistive access"* ]]; then
+    echo "$name: could not position the VS Code window — Accessibility permission is missing." >&2
+    echo "  Grant it in System Settings > Privacy & Security > Accessibility (enable Terminal," >&2
+    echo "  or whichever app runs this script), then re-run $name." >&2
+  elif [[ -n "$vscodePositionErr" ]]; then
+    echo "$name: could not position the VS Code window: $vscodePositionErr" >&2
+  fi
 
   # -------------------------------------------------------------------------
   # 6. The mirror desktop (BOTH layouts; disabled with ${PREFIX}_OVERVIEW=0).
