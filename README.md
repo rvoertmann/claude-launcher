@@ -28,24 +28,37 @@ On a wide display the right half is a 2×2 grid of four terminals:
 └───────────────────────┴───────────┴───────────┘
 ```
 
-On a laptop screen it drops to two full-width terminals, stacked:
+On a laptop screen it drops to **one** terminal filling the whole right half:
 
 ```
 ┌───────────────────────┬───────────────────────┐
-│                       │        claude         │
-│                       │       (term 1)        │
-│        VS Code        ├───────────────────────┤
-│                       │        claude         │
-│                       │       (term 2)        │
+│                       │                       │
+│                       │                       │
+│        VS Code        │        claude         │
+│                       │                       │
+│                       │                       │
 └───────────────────────┴───────────────────────┘
 ```
+
+### Why one session there, and not two tabs
+
+Two tabs in that window would be the obvious way to keep two sessions at full width, but Terminal.app
+cannot deliver it. Its scripting dictionary has no `make new tab` (`tab` is a read-only element), so
+a tab can only come from Terminal's own **New Tab** command — and whether that produces a tab or a
+whole new window is decided by macOS's **"Prefer tabs when opening documents"** (System Settings →
+Desktop & Dock). Unless that is set to `Always`, New Tab opens a *window*: verified here by clicking
+the menu item itself, not just by synthesizing ⌘T.
+
+Nor can the launcher set it for you — neither `defaults write -g AppleWindowTabbingMode always` nor
+the per-app domain takes effect while Terminal is running, because the value is read at launch. Since
+that makes tabs unreliable on an arbitrary Mac, the stacked layout runs a single session.
 
 ### Choosing the layout
 
 The launcher measures the screen and picks: the grid needs each terminal to be at least **640
 points** wide, and a terminal in the grid is a quarter of the screen. So displays 2560pt and wider
 (a 5K Studio Display, most 4K panels) get the grid, while a 16" MacBook Pro (1728pt → 432pt columns,
-too narrow for Claude Code's output) and a 14" (1512pt) get the stacked pair.
+too narrow for Claude Code's output) and a 14" (1512pt) get the single full-height terminal.
 
 Override it with environment variables:
 
@@ -55,7 +68,7 @@ Override it with environment variables:
 | `CLAUDE_LAUNCHER_MIN_COL` | points | `640` | Minimum terminal width `auto` requires to pick the grid |
 
 ```sh
-CLAUDE_LAUNCHER_LAYOUT=stacked claude-launcher ~/code/project   # two terminals, even on a big screen
+CLAUDE_LAUNCHER_LAYOUT=stacked claude-launcher ~/code/project   # one terminal, even on a big screen
 CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # four terminals, even on a laptop
 ```
 

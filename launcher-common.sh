@@ -10,11 +10,23 @@
 #                  differs between launchers — see the `launcher_build_command`
 #                  hook below).
 #
-# The right half holds a 2x2 grid of four terminals on a wide display, but only
-# two full-width terminals stacked vertically on a narrower one (a laptop's
+# The right half holds a 2x2 grid of four terminals on a wide display, but a
+# single terminal filling the whole right half on a narrower one (a laptop's
 # built-in screen). Quartering the right half of a 16" MacBook Pro leaves each
-# terminal ~430pt wide, which these CLIs' output does not fit into; halving it
-# horizontally keeps each one readable.
+# terminal ~430pt wide, which these CLIs' output does not fit into; one
+# full-height terminal keeps the session readable.
+#
+# (Why one session rather than two tabs: Terminal.app cannot create a tab
+# through its own scripting dictionary — `tab` is a read-only element, there is
+# no `make new tab` — so a tab can only come from Terminal's New Tab command.
+# Whether that yields a tab or a whole new window is decided by macOS's "Prefer
+# tabs when opening documents" (System Settings > Desktop & Dock): unless it is
+# set to "Always", New Tab opens a WINDOW — the menu item itself, not just the
+# Cmd+T keystroke. Nothing scriptable overrides it either; neither `defaults
+# write -g AppleWindowTabbingMode always` nor the per-app domain takes effect
+# while Terminal is running, since it is read at launch. So tabs cannot be
+# created reliably on an arbitrary Mac, and the stacked layout runs one session
+# instead.)
 #
 # (No browser pane: macOS pins a running browser's new windows to the Space the
 # browser last used, with no scriptable way to place or move them onto the
@@ -150,11 +162,9 @@ launcher_main() {
       "$xColMid"  "$yMid"  "$xRight"   "$yBottom"
     )
   else
-    #   TOP
-    #   BOTTOM
+    #   one terminal over the whole right half
     boxes=(
-      "$xHalf"  "$yTop"  "$xRight"  "$yMid"
-      "$xHalf"  "$yMid"  "$xRight"  "$yBottom"
+      "$xHalf"  "$yTop"  "$xRight"  "$yBottom"
     )
   fi
   local termCount=$(( ${#boxes[@]} / 4 ))
@@ -213,6 +223,11 @@ on run argv
     -- Diff window IDs around each `do script` so we tile the window we just
     -- created, never a pre-existing Terminal window. Collect "id|tty" for each
     -- created window so the launcher can record them for a later clean close.
+    --
+    -- Windows are tracked by *id*, never by an `item i of windows` reference:
+    -- that list is ordered front-to-back, so opening a window or bringing one to
+    -- the front renumbers it, and a held reference then silently points at a
+    -- different window. `window id N` stays valid for the window's life.
     set winRecs to {}
     tell application "Terminal"
         repeat with b from 0 to (boxCount - 1)
@@ -221,28 +236,35 @@ on run argv
             set T to (item (base + 1) of argv) as integer
             set R to (item (base + 2) of argv) as integer
             set Bo to (item (base + 3) of argv) as integer
-            set oldIDs to id of every window
-            do script cmd
-            delay 0.2
-            set newWin to missing value
-            repeat with w in windows
-                if (id of w) is not in oldIDs then
-                    set newWin to w
-                    exit repeat
-                end if
-            end repeat
-            if newWin is missing value then set newWin to front window
-            set bounds of newWin to {L, T, R, Bo}
+
+            set winID to my openWindow(cmd)
+            set bounds of window id winID to {L, T, R, Bo}
             set winTTY to ""
             try
-                set winTTY to tty of selected tab of newWin
+                set winTTY to tty of selected tab of window id winID
             end try
-            set end of winRecs to ((id of newWin) as text) & "|" & winTTY
+            set end of winRecs to (winID as text) & "|" & winTTY
         end repeat
     end tell
     set AppleScript's text item delimiters to ","
     return winRecs as text
 end run
+
+-- Run cmd in a brand-new Terminal window and return that window's id, found by
+-- diffing window ids so a pre-existing window is never mistaken for ours.
+on openWindow(cmd)
+    tell application "Terminal"
+        set oldIDs to id of every window
+        do script cmd
+        delay 0.2
+        repeat with w in windows
+            set wid to id of w
+            if wid is not in oldIDs then return wid
+        end repeat
+        return id of front window
+    end tell
+end openWindow
+
 APPLESCRIPT
 )"
 
