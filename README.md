@@ -200,6 +200,39 @@ app that runs the scripts (normally **Terminal**) to be granted Accessibility ac
 Until that's granted, everything else still tiles correctly, but VS Code may open without snapping
 into place. Grant the permission once and re-run.
 
+## Windows
+
+A PowerShell 7 port lives under [`windows/`](windows/) — it is a rewrite, not a port of the bash
+scripts (nothing macOS-specific carries over), but it keeps the same architecture: one shared
+engine (`LauncherCommon.psm1`), thin per-CLI wrappers, and a teardown that proves ownership before
+closing anything. See [`docs/windows-port-plan.md`](docs/windows-port-plan.md) for the full design.
+
+```powershell
+windows\Install.ps1                              # generates .cmd shims onto your user PATH
+
+claude-launcher  [folder] [plugin-dir]            # open the layout, consoles run Claude Code
+claude-launcher-close                             # close the most recent Claude layout
+
+copilot-launcher [folder]                         # open the layout, consoles run the Copilot CLI
+```
+
+Differences from the macOS behavior:
+
+- **Grid layout is configurable.** `${PREFIX}_GRID_MODE` picks how a `grid` layout is realized:
+  `panes` (default) — one Windows Terminal window split 2×2 — or `windows` — four separate tiled
+  windows, for macOS parity. `${PREFIX}_LAYOUT` and `${PREFIX}_MIN_COL` mean the same as on macOS,
+  except the width comparison is against **effective (DPI-independent) width**, not raw pixels.
+- **No Accessibility-style permission is required.** VS Code positioning and closing use
+  `EnumWindows`/`SetWindowPos`/`PostMessage`, which need no special grant.
+- **Monitor selection** is the monitor under the mouse cursor, not the "main" display.
+- **Teardown never force-kills**, same rule as macOS: it verifies a window is still the one this
+  launch created (HWND, PID, and PID start time all still matching) before sending it `WM_CLOSE`,
+  and leaves anything that fails that check alone.
+- **VS Code close does not auto-discard unsaved edits.** Windows will show its own save prompt if
+  one applies; nothing clicks "Don't Save" on your behalf.
+- Windows Terminal may prompt for confirmation when a panes-mode window with multiple panes is
+  closed, unless you set `"confirmCloseAllTabs": false` in its `settings.json`.
+
 ## Notes
 
 - **Opening a VS Code window (`code -n`) unavoidably *activates* VS Code.** If its only other

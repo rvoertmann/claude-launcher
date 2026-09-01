@@ -89,6 +89,11 @@
 #
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "claude-launcher-close: requires macOS; see windows/ for the PowerShell port" >&2
+  exit 1
+fi
+
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-launcher"
 SESS_DIR="$STATE_DIR/sessions"
 

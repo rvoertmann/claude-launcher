@@ -72,6 +72,11 @@
 launcher_main() {
   set -euo pipefail
 
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "${LAUNCHER_NAME:-launcher}: requires macOS; see windows/ for the PowerShell port" >&2
+    exit 1
+  fi
+
   local prefix="${LAUNCHER_ENV_PREFIX:?LAUNCHER_ENV_PREFIX must be set}"
   local name="${LAUNCHER_NAME:?LAUNCHER_NAME must be set}"
   local usage="${LAUNCHER_USAGE:-Usage: $name [folder]}"
