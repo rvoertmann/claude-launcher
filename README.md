@@ -16,7 +16,7 @@ There are two launchers, sharing one engine:
 Both do the exact same tiling; they differ only in which CLI the terminals run. That single
 difference is all that lives in each launcher — see [Architecture](#architecture) below.
 
-On a wide display the right half is a 2×2 grid of four terminals:
+On a wide display the right half is a 2×2 grid of four equal consoles:
 
 ```
 ┌───────────────────────┬───────────┬───────────┐
@@ -28,7 +28,7 @@ On a wide display the right half is a 2×2 grid of four terminals:
 └───────────────────────┴───────────┴───────────┘
 ```
 
-On a laptop screen it drops to **one** terminal filling the whole right half:
+On a laptop screen it drops to **one** console filling the whole right half:
 
 ```
 ┌───────────────────────┬───────────────────────┐
@@ -40,36 +40,34 @@ On a laptop screen it drops to **one** terminal filling the whole right half:
 └───────────────────────┴───────────────────────┘
 ```
 
-### Why one session there, and not two tabs
+### Four windows, not four panes
 
-Two tabs in that window would be the obvious way to keep two sessions at full width, but Terminal.app
-cannot deliver it. Its scripting dictionary has no `make new tab` (`tab` is a read-only element), so
-a tab can only come from Terminal's own **New Tab** command — and whether that produces a tab or a
-whole new window is decided by macOS's **"Prefer tabs when opening documents"** (System Settings →
-Desktop & Dock). Unless that is set to `Always`, New Tab opens a *window*: verified here by clicking
-the menu item itself, not just by synthesizing ⌘T.
+The grid's four consoles are four separate Terminal.app **windows**, tiled into the quarters.
+Terminal cannot split a window, and its scripting dictionary has no `make new tab` either (`tab` is
+a read-only element), so tiled windows are the only route to four consoles.
 
-Nor can the launcher set it for you — neither `defaults write -g AppleWindowTabbingMode always` nor
-the per-app domain takes effect while Terminal is running, because the value is read at launch. Since
-that makes tabs unreliable on an arbitrary Mac, the stacked layout runs a single session.
+Panes and tabs were possible under **iTerm2**, which this launcher used for a while — along with a
+read-only "overview" desktop that mirrored every console onto its own Space via tmux. iTerm2 turned
+out to be slow enough to drop, so the engine is back on Terminal.app and the tmux/mirror layer is
+gone with it (`${PREFIX}_OVERVIEW` no longer does anything).
 
 ### Choosing the layout
 
-The launcher measures the screen and picks: the grid needs each terminal to be at least **640
-points** wide, and a terminal in the grid is a quarter of the screen. So displays 2560pt and wider
-(a 5K Studio Display, most 4K panels) get the grid, while a 16" MacBook Pro (1728pt → 432pt columns,
-too narrow for Claude Code's output) and a 14" (1512pt) get the single full-height terminal.
+The launcher measures the screen and picks: the grid needs each console to be at least **640
+points** wide, and a grid console is a quarter of the screen. So displays 2560pt and wider (a 5K
+Studio Display, most 4K panels) get the grid, while a 16" MacBook Pro (1728pt → 432pt columns, too
+narrow for Claude Code's output) and a 14" (1512pt) get the single full-height console.
 
 Override it with environment variables:
 
 | Variable | Values | Default | Meaning |
 | --- | --- | --- | --- |
 | `CLAUDE_LAUNCHER_LAYOUT` | `auto`, `grid`, `stacked` | `auto` | Force a layout instead of measuring |
-| `CLAUDE_LAUNCHER_MIN_COL` | points | `640` | Minimum terminal width `auto` requires to pick the grid |
+| `CLAUDE_LAUNCHER_MIN_COL` | points | `640` | Minimum console width `auto` requires to pick the grid |
 
 ```sh
-CLAUDE_LAUNCHER_LAYOUT=stacked claude-launcher ~/code/project   # one terminal, even on a big screen
-CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # four terminals, even on a laptop
+CLAUDE_LAUNCHER_LAYOUT=stacked claude-launcher ~/code/project   # one console, even on a big screen
+CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # four consoles, even on a laptop
 ```
 
 Each launcher reads its own env namespace, so `copilot-launcher` uses `COPILOT_LAUNCHER_LAYOUT` and
@@ -155,8 +153,11 @@ claude-launcher-close <session-id>    # close a specific launch
 
 What it does per window:
 
-- **Terminals** — force-quits each session (`kill -9` every process on its recorded tty, so there
-  is no "terminate the running process?" prompt), then closes the window by its recorded id.
+- **Terminals** — hangs each session up with `SIGHUP` over its recorded tty (the same signal a closing
+  terminal sends, so the CLI shuts down normally and there is no "terminate the running process?"
+  prompt), then closes its window. Both steps run only after the recorded window id is confirmed to
+  still hold a tab on the recorded tty — ids and ttys are both recyclable, so requiring the two to
+  agree is what stops a teardown from ever hitting a window this launch did not create.
   Terminal takes a second or two to remove a "[Process completed]" window; that lag is cosmetic.
 - **VS Code** — VS Code windows have no scriptable id, so ours is identified by its **full folder
   path**: the window whose open document lives inside the launched folder. Only if no file is open

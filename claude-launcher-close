@@ -2,8 +2,19 @@
 #
 # claude-launcher-close — close the windows a `claude-launcher` run created,
 # and only those. Reads the per-launch record written under $STATE_DIR and tears
-# down exactly the tmux sessions, iTerm2 windows/sessions and VS Code window
-# from that launch.
+# down exactly the Terminal.app window(s) and the VS Code window from that
+# launch.
+#
+# ---------------------------------------------------------------------------
+# Three record formats
+# ---------------------------------------------------------------------------
+# The launcher has had three engines, and a state dir can hold records from all
+# of them. `engine=terminal-windows` (the current one: Terminal.app, one window
+# per console) is closed by close_terminal_window below, once per console. Records from the iTerm2 engine still
+# carry `iterm_session_ids`/`tmux_sessions` and are torn down by the legacy
+# iTerm2 path further down, so a launch that was open across the migration can
+# still be closed. The oldest, pre-iTerm2 records carry neither marker and are
+# refused outright — see close_session.
 #
 # Usage:
 #   claude-launcher-close                 # close the most recent session
@@ -119,17 +130,17 @@ fi
 # a two-variable `read` also keeps any `=` inside a value intact, since the
 # trailing fields all land in the last variable).
 #
-# `record_format` is the interesting one: it is "iterm" only when the file
-# carries at least one of the keys the iTerm2 engine introduced, and "terminal"
-# otherwise. See close_session for why an old record is refused rather than
-# translated.
-session=""; folder=""; vscode_title=""; terminal_ids=""
+# `record_format` is the interesting one: "terminal-single" when the record
+# carries the current engine's marker, "iterm" when it carries one of the keys
+# the iTerm2 engine introduced, and "legacy" otherwise. See close_session for
+# why a legacy record is refused rather than translated.
+session=""; folder=""; vscode_title=""; terminal_ids=""; terminal_ttys=""
 iterm_session_ids=""; tmux_sessions=""; mirror_window_id=""; mirror_session_ids=""
-record_format="terminal"
+record_format="legacy"
 parse_session() {
-  session=""; folder=""; vscode_title=""; terminal_ids=""
+  session=""; folder=""; vscode_title=""; terminal_ids=""; terminal_ttys=""
   iterm_session_ids=""; tmux_sessions=""; mirror_window_id=""; mirror_session_ids=""
-  record_format="terminal"
+  record_format="legacy"
   local key val
   while IFS='=' read -r key val; do
     case "$key" in
@@ -137,6 +148,8 @@ parse_session() {
       folder)             folder="$val" ;;
       vscode_title)       vscode_title="$val" ;;
       terminal_ids)       terminal_ids="$val" ;;
+      terminal_ttys)      terminal_ttys="$val" ;;
+      engine)             [[ "$val" == "terminal-windows" ]] && record_format="terminal-windows" ;;
       iterm_session_ids)  iterm_session_ids="$val"; record_format="iterm" ;;
       tmux_sessions)      tmux_sessions="$val";     record_format="iterm" ;;
       mirror_window_id)   mirror_window_id="$val";  record_format="iterm" ;;
@@ -148,12 +161,12 @@ parse_session() {
 if [[ "$mode" == "list" ]]; then
   for f in "${all_files[@]}"; do
     parse_session "$f"
-    if [[ "$record_format" == "iterm" ]]; then
-      printf '%s\t%s\n' "$session" "$folder"
-    else
+    if [[ "$record_format" == "legacy" ]]; then
       # Third column only for records this build cannot act on, so the normal
       # two-column output is unchanged.
       printf '%s\t%s\t(pre-iTerm2 record — cannot be closed)\n' "$session" "$folder"
+    else
+      printf '%s\t%s\n' "$session" "$folder"
     fi
   done
   exit 0
@@ -181,6 +194,126 @@ case "$mode" in
         fi
         [[ -n "$f" ]] && files+=("$f") ;;
 esac
+
+# ---------------------------------------------------------------------------
+# terminal_window_holds_tty <window-id> <tty>
+#   Echo "yes" when Terminal.app has a window with that id AND that window holds
+#   a tab on that tty; "no" otherwise (including when Terminal is not running).
+#
+#   THE HAZARD THIS EXISTS TO CLOSE. A window id is an integer from Terminal's
+#   own counter and that counter restarts when Terminal does; a state file
+#   outlives the app. So an id alone is not proof of ownership — quit Terminal
+#   with a launch's window open and id 3 may name someone else's work tomorrow.
+#   A tty is likewise reusable on its own. Requiring BOTH to line up on the same
+#   live window is what makes "close only what this launch created" hold: an
+#   unrelated window would have to be handed the same id AND the same tty.
+# ---------------------------------------------------------------------------
+terminal_window_holds_tty() {
+  osascript - "$1" "$2" 2>/dev/null <<'APPLESCRIPT' || true
+on run argv
+    set wantID to item 1 of argv
+    set wantTTY to item 2 of argv
+    -- Never launch Terminal just to look for windows that cannot exist.
+    if not (application "Terminal" is running) then return "no"
+    if wantID is "" or wantTTY is "" then return "no"
+    tell application "Terminal"
+        try
+            repeat with w in windows
+                set thisID to ""
+                try
+                    set thisID to (id of w) as text
+                end try
+                if thisID is wantID then
+                    try
+                        repeat with t in tabs of w
+                            set thisTTY to ""
+                            try
+                                set thisTTY to tty of t
+                            end try
+                            if thisTTY is wantTTY then return "yes"
+                        end repeat
+                    end try
+                    return "no"
+                end if
+            end repeat
+        end try
+    end tell
+    return "no"
+end run
+APPLESCRIPT
+}
+
+# ---------------------------------------------------------------------------
+# close_terminal_window <window-id> <tty>
+#   Close the launch's Terminal.app window, after proving it is still ours.
+#
+#   The CLI is hung up first, over the tty, rather than by closing a window with
+#   a live foreground process — which is what raises Terminal's "terminate the
+#   running process?" sheet. SIGHUP (not SIGKILL) is what a closing terminal
+#   sends anyway, so the CLI gets its normal shutdown; it reaches the login
+#   shell too, which is usually enough to close the window by itself, so the
+#   explicit close afterwards is often a no-op and is allowed to fail.
+#
+#   `pkill -t` is only ever reached after terminal_window_holds_tty said yes, so
+#   the tty is known to belong to the window this launch recorded. Without that
+#   proof nothing is signalled at all — a recycled tty could name a session the
+#   user is working in.
+# ---------------------------------------------------------------------------
+close_terminal_window() {
+  local winid="$1" tty="${2:-}"
+  # "-" is the launcher's placeholder for a value it could not read; there is
+  # nothing to verify against, so nothing is closed.
+  [[ -n "$winid" && -n "$tty" && "$winid" != "-" && "$tty" != "-" ]] || return 0
+
+  if [[ "$(terminal_window_holds_tty "$winid" "$tty")" != "yes" ]]; then
+    echo "  terminal window $winid is gone (or no longer ours) — left alone"
+    return 0
+  fi
+
+  pkill -HUP -t "${tty#/dev/}" 2>/dev/null || true
+  sleep 0.5
+
+  osascript - "$winid" "$tty" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+    set wantID to item 1 of argv
+    set wantTTY to item 2 of argv
+    if not (application "Terminal" is running) then return
+    tell application "Terminal"
+        try
+            repeat with w in windows
+                set thisID to ""
+                try
+                    set thisID to (id of w) as text
+                end try
+                if thisID is wantID then
+                    -- Re-prove ownership: the hangup above may already have
+                    -- closed the window, and ids are recyclable.
+                    set isOurs to false
+                    try
+                        repeat with t in tabs of w
+                            set thisTTY to ""
+                            try
+                                set thisTTY to tty of t
+                            end try
+                            if thisTTY is wantTTY then
+                                set isOurs to true
+                                exit repeat
+                            end if
+                        end repeat
+                    end try
+                    if isOurs then
+                        try
+                            close w
+                        end try
+                    end if
+                    exit repeat
+                end if
+            end repeat
+        end try
+    end tell
+end run
+APPLESCRIPT
+}
 
 # ---------------------------------------------------------------------------
 # kill_tmux_sessions <name>...
@@ -503,7 +636,7 @@ close_session() {
   # recent session" forever and every plain `claude-launcher-close` would do
   # nothing at all. Any Terminal.app windows still standing are the user's to
   # close, and closing a window by hand is cheap; closing the wrong one is not.
-  if [[ "$record_format" != "iterm" ]]; then
+  if [[ "$record_format" == "legacy" ]]; then
     echo "claude-launcher-close: session ${session:-?} ($folder) predates the iTerm2 migration"
     echo "  Its window ids name Terminal.app windows and its ttys may since have been"
     echo "  reassigned, so neither can be replayed safely. Nothing was closed; close any"
@@ -517,6 +650,28 @@ close_session() {
 
   echo "closing session ${session:-?} ($folder)"
 
+  # -- The current engine: one Terminal.app window per console ----------------
+  if [[ "$record_format" == "terminal-windows" ]]; then
+    # `terminal_ids` and `terminal_ttys` are index-aligned: one entry each per
+    # console (four in the grid layout, one in the stacked one), with "-" for a
+    # slot whose id or tty could not be read. They are walked as pairs, because
+    # a window is only closed on the two agreeing — see close_terminal_window.
+    local -a _ids _ttys
+    read -ra _ids  <<< "${terminal_ids:-}"
+    read -ra _ttys <<< "${terminal_ttys:-}"
+    local i
+    for (( i = 0; i < ${#_ids[@]}; i++ )); do
+      close_terminal_window "${_ids[i]}" "${_ttys[i]:-}"
+    done
+    close_vscode_window
+    rm -f "$file"
+    if [[ "$(readlink "$STATE_DIR/last.session" 2>/dev/null)" == "$file" ]]; then
+      rm -f "$STATE_DIR/last.session"
+    fi
+    return 0
+  fi
+
+  # -- Legacy iTerm2 engine ---------------------------------------------------
   # 1. tmux first — the clean kill (see the header).
   kill_tmux_sessions ${tmux_sessions:-}
 
@@ -547,11 +702,28 @@ close_session() {
   #    no-op, because step 3 already took the whole window.
   close_iterm_sessions ${iterm_session_ids:-}
 
-  # 5. VS Code has no scriptable window id, so identify our window by its FULL
-  # folder path: the window whose open document (AXDocument, a file:// URL) sits
-  # inside the launched folder is unambiguously ours. Only if no file is open
-  # (fresh window, empty AXDocument) do we fall back to the basename title.
-  # Then close it and force-discard any "save changes?" sheet via "Don't Save".
+  # 5. VS Code.
+  close_vscode_window
+
+  rm -f "$file"
+  # Drop the `last` pointer if it referenced this session.
+  if [[ "$(readlink "$STATE_DIR/last.session" 2>/dev/null)" == "$file" ]]; then
+    rm -f "$STATE_DIR/last.session"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# close_vscode_window
+#   Close the launch's VS Code window. Reads the parsed `folder` and
+#   `vscode_title` globals, and is shared by both teardown paths.
+#
+#   VS Code has no scriptable window id, so our window is identified by its FULL
+#   folder path: the window whose open document (AXDocument, a file:// URL) sits
+#   inside the launched folder is unambiguously ours. Only if no file is open
+#   (fresh window, empty AXDocument) do we fall back to the basename title.
+#   Then close it and force-discard any "save changes?" sheet via "Don't Save".
+# ---------------------------------------------------------------------------
+close_vscode_window() {
   if [[ -n "${folder:-}" ]]; then
     osascript - "$folder" "${vscode_title:-}" >/dev/null 2>&1 <<'APPLESCRIPT' || true
 on urldecode(s)
@@ -607,12 +779,6 @@ on run argv
     end try
 end run
 APPLESCRIPT
-  fi
-
-  rm -f "$file"
-  # Drop the `last` pointer if it referenced this session.
-  if [[ "$(readlink "$STATE_DIR/last.session" 2>/dev/null)" == "$file" ]]; then
-    rm -f "$STATE_DIR/last.session"
   fi
 }
 
