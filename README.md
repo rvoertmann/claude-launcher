@@ -16,15 +16,15 @@ There are two launchers, sharing one engine:
 Both do the exact same tiling; they differ only in which CLI the terminals run. That single
 difference is all that lives in each launcher — see [Architecture](#architecture) below.
 
-On a wide display the right half is a 2×2 grid of four equal consoles:
+On a wide display the right half holds two equal full-height consoles side by side:
 
 ```
 ┌───────────────────────┬───────────┬───────────┐
+│                       │           │           │
 │                       │  claude   │  claude   │
-│                       │  (term 1) │  (term 2) │
-│        VS Code        ├───────────┼───────────┤
-│                       │  claude   │  claude   │
-│                       │  (term 3) │  (term 4) │
+│        VS Code        │  (term 1) │  (term 2) │
+│                       │           │           │
+│                       │           │           │
 └───────────────────────┴───────────┴───────────┘
 ```
 
@@ -40,11 +40,11 @@ On a laptop screen it drops to **one** console filling the whole right half:
 └───────────────────────┴───────────────────────┘
 ```
 
-### Four windows, not four panes
+### Two windows, not two panes
 
-The grid's four consoles are four separate Terminal.app **windows**, tiled into the quarters.
+The grid's two consoles are two separate Terminal.app **windows**, tiled into the two columns.
 Terminal cannot split a window, and its scripting dictionary has no `make new tab` either (`tab` is
-a read-only element), so tiled windows are the only route to four consoles.
+a read-only element), so tiled windows are the only route to two consoles.
 
 Panes and tabs were possible under **iTerm2**, which this launcher used for a while — along with a
 read-only "overview" desktop that mirrored every console onto its own Space via tmux. iTerm2 turned
@@ -67,7 +67,7 @@ Override it with environment variables:
 
 ```sh
 CLAUDE_LAUNCHER_LAYOUT=stacked claude-launcher ~/code/project   # one console, even on a big screen
-CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # four consoles, even on a laptop
+CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # two consoles, even on a laptop
 ```
 
 Each launcher reads its own env namespace, so `copilot-launcher` uses `COPILOT_LAUNCHER_LAYOUT` and
@@ -219,8 +219,8 @@ copilot-launcher [folder]                         # open the layout, consoles ru
 Differences from the macOS behavior:
 
 - **Grid layout is configurable.** `${PREFIX}_GRID_MODE` picks how a `grid` layout is realized:
-  `panes` (default) — one Windows Terminal window split 2×2 — or `windows` — four separate tiled
-  windows, for macOS parity. `${PREFIX}_LAYOUT` and `${PREFIX}_MIN_COL` mean the same as on macOS,
+  `panes` (default), one Windows Terminal window split side by side into two panes, or `windows`,
+  two separate tiled windows, for macOS parity. `${PREFIX}_LAYOUT` and `${PREFIX}_MIN_COL` mean the same as on macOS,
   except the width comparison is against **effective (DPI-independent) width**, not raw pixels.
 - **No Accessibility-style permission is required.** VS Code positioning and closing use
   `EnumWindows`/`SetWindowPos`/`PostMessage`, which need no special grant.

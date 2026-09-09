@@ -11,16 +11,16 @@
 #
 # Two layouts, chosen from the display's width:
 #
-#   grid     (wide display)   FOUR equal Terminal.app windows tiled 2x2 over the
-#                             right half — each a quarter of the screen wide and
-#                             half its height.
+#   grid     (wide display)   TWO equal Terminal.app windows side by side over
+#                             the right half, each a quarter of the screen wide
+#                             and its full height.
 #   stacked  (narrow display) ONE Terminal.app window over the whole right half.
 #
-# Quartering the right half of a 16" MacBook Pro leaves each console ~430pt
-# wide, which these CLIs' output does not fit into — hence `stacked` on a laptop
-# panel. The four grid consoles are separate WINDOWS, not panes or tabs:
+# Halving the right half of a 16" MacBook Pro leaves each console ~430pt wide,
+# which these CLIs' output does not fit into, hence `stacked` on a laptop
+# panel. The two grid consoles are separate WINDOWS, not panes or tabs:
 # Terminal.app cannot split a window, and its scripting dictionary has no `make
-# new tab` either, so tiled windows are the only way to get four consoles.
+# new tab` either, so tiled windows are the only way to get two consoles.
 #
 # There is no tmux layer and no mirror/overview desktop any more: both were
 # built on iTerm2, which was slow enough to be worth dropping outright.
@@ -138,12 +138,11 @@ launcher_main() {
     exit 1
   fi
 
-  local xHalf xColMid xRight yTop yMid yBottom
+  local xHalf xColMid xRight yTop yBottom
   xHalf=$(( VX + VW / 2 ))          # boundary between VS Code (left) and consoles
   xColMid=$(( VX + 3 * VW / 4 ))    # vertical split of the right half
   xRight=$(( VX + VW ))
   yTop=$VY
-  yMid=$(( VY + VH / 2 ))           # horizontal split of the right half
   yBottom=$(( VY + VH ))
 
   # VS Code occupies the entire left half.
@@ -166,13 +165,10 @@ launcher_main() {
   # osascript. One console per window in both layouts.
   local -a boxes
   if [[ "$layout" == "grid" ]]; then
-    #   TL              TR      four equal windows
-    #   BL              BR
+    #   L   R    two equal full-height windows, side by side
     boxes=(
-      "$xHalf"    "$yTop"  "$xColMid"  "$yMid"
-      "$xColMid"  "$yTop"  "$xRight"   "$yMid"
-      "$xHalf"    "$yMid"  "$xColMid"  "$yBottom"
-      "$xColMid"  "$yMid"  "$xRight"   "$yBottom"
+      "$xHalf"    "$yTop"  "$xColMid"  "$yBottom"
+      "$xColMid"  "$yTop"  "$xRight"   "$yBottom"
     )
   else
     #   one window over the whole right half

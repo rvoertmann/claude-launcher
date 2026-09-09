@@ -658,7 +658,7 @@ close_session() {
   # -- The current engine: one Terminal.app window per console ----------------
   if [[ "$record_format" == "terminal-windows" ]]; then
     # `terminal_ids` and `terminal_ttys` are index-aligned: one entry each per
-    # console (four in the grid layout, one in the stacked one), with "-" for a
+    # console (two in the grid layout, one in the stacked one), with "-" for a
     # slot whose id or tty could not be read. They are walked as pairs, because
     # a window is only closed on the two agreeing — see close_terminal_window.
     local -a _ids _ttys

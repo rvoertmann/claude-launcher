@@ -13,11 +13,12 @@
 #
 # Two layouts, chosen from the monitor's effective (DPI-independent) width:
 #
-#   grid     (wide display)   FOUR consoles over the right half, arranged
-#                              2x2. Realized either as one Windows Terminal
-#                              window split into four panes (${PREFIX}_GRID_MODE
-#                              = panes, default) or as four separate tiled
-#                              windows (${PREFIX}_GRID_MODE = windows).
+#   grid     (wide display)   TWO full-height consoles side by side over the
+#                              right half. Realized either as one Windows
+#                              Terminal window split into two panes
+#                              (${PREFIX}_GRID_MODE = panes, default) or as two
+#                              separate tiled windows (${PREFIX}_GRID_MODE =
+#                              windows).
 #   stacked  (narrow display) ONE console over the whole right half.
 #
 # There is no virtual-desktop handling: VS Code and Windows Terminal always
@@ -230,8 +231,8 @@ function Select-LauncherLayout {
 
 # ---------------------------------------------------------------------------
 # Get-LauncherGridMode <envPrefix>
-#   ${PREFIX}_GRID_MODE: panes (default, one WT window split 2x2) | windows
-#   (four separate tiled WT windows, macOS parity).
+#   ${PREFIX}_GRID_MODE: panes (default, one WT window split side by side) |
+#   windows (two separate tiled WT windows, macOS parity).
 # ---------------------------------------------------------------------------
 function Get-LauncherGridMode {
     param([Parameter(Mandatory)][string]$Prefix)
@@ -561,7 +562,7 @@ function Start-LauncherTerminal {
         [Parameter(Mandatory)][string]$Folder,
         [Parameter(Mandatory)][AllowEmptyString()][string]$PaneCommand,
         [Parameter(Mandatory)]$RightHalfBox,
-        [Parameter(Mandatory)][object[]]$QuarterBoxes
+        [Parameter(Mandatory)][object[]]$ColumnBoxes
     )
 
     $consoles = @()
@@ -582,9 +583,9 @@ function Start-LauncherTerminal {
     }
 
     if ($GridMode -eq 'windows') {
-        # Grid parity: four separate tiled windows, one per quarter.
-        for ($i = 0; $i -lt $QuarterBoxes.Count; $i++) {
-            $box = $QuarterBoxes[$i]
+        # Grid parity: two separate tiled windows, one per column.
+        for ($i = 0; $i -lt $ColumnBoxes.Count; $i++) {
+            $box = $ColumnBoxes[$i]
             $paneScript = New-LauncherPaneScript -Folder $Folder -CommandText $PaneCommand
             $before = Get-TopLevelWindows -ClassName $script:CASCADIA_HOSTING_WINDOW_CLASS
             $wtArgs = @(
@@ -599,23 +600,18 @@ function Start-LauncherTerminal {
         return , $consoles
     }
 
-    # panes (default): one window, split 2x2, sized over the whole right half.
-    # `--size` is skipped entirely (it takes columns/rows, not pixels); `--pos`
-    # places the window and Set-WindowRect corrects it to exact pixels after.
+    # panes (default): one window split side by side into two full-height
+    # panes, sized over the whole right half. `--size` is skipped entirely (it
+    # takes columns/rows, not pixels); `--pos` places the window and
+    # Set-WindowRect corrects it to exact pixels after.
     $box = $RightHalfBox
     $s1 = New-LauncherPaneScript -Folder $Folder -CommandText $PaneCommand
     $s2 = New-LauncherPaneScript -Folder $Folder -CommandText $PaneCommand
-    $s3 = New-LauncherPaneScript -Folder $Folder -CommandText $PaneCommand
-    $s4 = New-LauncherPaneScript -Folder $Folder -CommandText $PaneCommand
     $before = Get-TopLevelWindows -ClassName $script:CASCADIA_HOSTING_WINDOW_CLASS
     $wtArgs = @(
         '-w', "cl-$SessionId", '--pos', "$($box.X),$($box.Y)",
         'new-tab', '-d', $Folder, 'pwsh', '-NoExit', '-File', $s1, ';'
-        'split-pane', '-V', '-d', $Folder, 'pwsh', '-NoExit', '-File', $s2, ';'
-        'move-focus', 'left', ';'
-        'split-pane', '-H', '-d', $Folder, 'pwsh', '-NoExit', '-File', $s3, ';'
-        'move-focus', 'right', ';'
-        'split-pane', '-H', '-d', $Folder, 'pwsh', '-NoExit', '-File', $s4
+        'split-pane', '-V', '-d', $Folder, 'pwsh', '-NoExit', '-File', $s2
     )
     Start-Process -FilePath 'wt.exe' -ArgumentList $wtArgs | Out-Null
     $found = Wait-ForNewWindow -ClassName $script:CASCADIA_HOSTING_WINDOW_CLASS -Before $before -Count 1
@@ -773,22 +769,19 @@ function Invoke-LauncherMain {
     $xColMid = $geometry.X + [int](3 * $geometry.Width / 4)
     $xRight = $geometry.X + $geometry.Width
     $yTop = $geometry.Y
-    $yMid = $geometry.Y + [int]($geometry.Height / 2)
     $yBottom = $geometry.Y + $geometry.Height
 
     $vsBox = [PSCustomObject]@{ X = $geometry.X; Y = $yTop; Width = [int]($geometry.Width / 2); Height = $geometry.Height }
     $rightHalfBox = [PSCustomObject]@{ X = $xHalf; Y = $yTop; Width = ($xRight - $xHalf); Height = ($yBottom - $yTop) }
-    $quarterBoxes = @(
-        [PSCustomObject]@{ X = $xHalf; Y = $yTop; Width = ($xColMid - $xHalf); Height = ($yMid - $yTop) }
-        [PSCustomObject]@{ X = $xColMid; Y = $yTop; Width = ($xRight - $xColMid); Height = ($yMid - $yTop) }
-        [PSCustomObject]@{ X = $xHalf; Y = $yMid; Width = ($xColMid - $xHalf); Height = ($yBottom - $yMid) }
-        [PSCustomObject]@{ X = $xColMid; Y = $yMid; Width = ($xRight - $xColMid); Height = ($yBottom - $yMid) }
+    $columnBoxes = @(
+        [PSCustomObject]@{ X = $xHalf; Y = $yTop; Width = ($xColMid - $xHalf); Height = ($yBottom - $yTop) }
+        [PSCustomObject]@{ X = $xColMid; Y = $yTop; Width = ($xRight - $xColMid); Height = ($yBottom - $yTop) }
     )
 
     $vscodeConsole = Start-LauncherVSCode -Folder $folder -Box $vsBox
 
     $consoles = Start-LauncherTerminal -SessionId $sid -Layout $layout -GridMode $gridMode `
-        -Folder $folder -PaneCommand $paneCommand -RightHalfBox $rightHalfBox -QuarterBoxes $quarterBoxes
+        -Folder $folder -PaneCommand $paneCommand -RightHalfBox $rightHalfBox -ColumnBoxes $columnBoxes
 
     $consoleCount = @($consoles).Count
     $layoutDesc = if ($layout -eq 'grid') { "grid layout, $gridMode mode" } else { 'stacked layout' }
