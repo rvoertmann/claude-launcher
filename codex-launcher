@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# codex-launcher: tile VS Code + Terminal.app windows on the current Space,
+# with each terminal running an OpenAI Codex CLI session in the target folder.
+# The Codex counterpart to `claude-launcher`.
+#
+# All the tiling/VS Code work lives in launcher-common.sh; this file only pins
+# the Codex command each terminal runs. There is deliberately no companion
+# `codex-launcher-close`: launches are not recorded, so close the windows
+# yourself when you're done.
+#
+# Usage:
+#   codex-launcher [folder]
+#     folder  defaults to the current directory
+#
+# Environment:
+#   CODEX_LAUNCHER_LAYOUT   auto (default) | grid | stacked
+#   CODEX_LAUNCHER_MIN_COL  minimum terminal width, in points, that `auto`
+#                           requires before it chooses the grid (default 640)
+set -euo pipefail
+
+# Locate launcher-common.sh next to this script, following any symlinks (the
+# script is normally symlinked onto PATH from ~/.local/bin).
+_src="${BASH_SOURCE[0]}"
+while [[ -h "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+# shellcheck source=launcher-common.sh
+source "$_dir/launcher-common.sh"
+
+LAUNCHER_NAME="codex-launcher"
+LAUNCHER_ENV_PREFIX="CODEX_LAUNCHER"
+LAUNCHER_USAGE="Usage: codex-launcher [folder]   (folder defaults to the current directory)"
+LAUNCHER_RECORD="0"   # not recorded: there is no companion close command
+
+# launcher_build_command <folder>
+#   Command each terminal runs after cd'ing into <folder>. Starts an interactive
+#   Codex session with `--dangerously-bypass-approvals-and-sandbox` (the Codex
+#   analog to Claude's `--dangerously-skip-permissions`: no approval prompts and
+#   no sandbox around the commands it runs). Prefer `codex` on PATH, fall back
+#   to the standalone installer's location under ~/.local/bin. Each session runs
+#   under `caffeinate -i` so the Mac stays awake for as long as that terminal's
+#   Codex session is running. If neither binary exists, print a hint and drop
+#   into a normal shell rather than leaving a bare "command not found".
+launcher_build_command() {
+  local codexArgs="--dangerously-bypass-approvals-and-sandbox"
+
+  printf '%s' \
+    "if command -v codex >/dev/null 2>&1; then caffeinate -i codex $codexArgs; elif [ -x \"\$HOME/.local/bin/codex\" ]; then caffeinate -i \"\$HOME/.local/bin/codex\" $codexArgs; else echo 'codex-launcher: the Codex CLI (\`codex\`) was not found on PATH or in ~/.local/bin, install it with: npm install -g @openai/codex'; exec \"\$SHELL\"; fi"
+}
+
+launcher_main "$@"

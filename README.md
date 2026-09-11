@@ -1,19 +1,21 @@
-# claude-launcher / copilot-launcher
+# claude-launcher / copilot-launcher / codex-launcher
 
 Instantly set up a coding layout on macOS: **VS Code on the left half** and **Terminal.app windows
 on the right**, each running an AI coding CLI in a target folder. Everything is scaffolded on the
 **current Space** (virtual desktop), and `claude-launcher-close` tears the whole layout back down
 again.
 
-There are two launchers, sharing one engine:
+There are three launchers, sharing one engine:
 
 - **`claude-launcher`** — each terminal runs a **Claude Code** session
   (`claude --dangerously-skip-permissions`). Records each launch so
   `claude-launcher-close` can tear it down later.
 - **`copilot-launcher`** — each terminal runs a **GitHub Copilot CLI** session
   (`copilot --allow-all --autopilot`). No close command — close the windows yourself when done.
+- **`codex-launcher`**: each terminal runs an **OpenAI Codex CLI** session
+  (`codex --dangerously-bypass-approvals-and-sandbox`). No close command either.
 
-Both do the exact same tiling; they differ only in which CLI the terminals run. That single
+All three do the exact same tiling; they differ only in which CLI the terminals run. That single
 difference is all that lives in each launcher — see [Architecture](#architecture) below.
 
 On a wide display the right half holds two equal full-height consoles side by side:
@@ -71,7 +73,8 @@ CLAUDE_LAUNCHER_LAYOUT=grid    claude-launcher ~/code/project   # two consoles, 
 ```
 
 Each launcher reads its own env namespace, so `copilot-launcher` uses `COPILOT_LAUNCHER_LAYOUT` and
-`COPILOT_LAUNCHER_MIN_COL` with the same meanings.
+`COPILOT_LAUNCHER_MIN_COL`, and `codex-launcher` uses `CODEX_LAUNCHER_LAYOUT` and
+`CODEX_LAUNCHER_MIN_COL`, with the same meanings.
 
 ### No browser pane
 
@@ -103,6 +106,7 @@ claude-launcher  [folder] [plugin-dir]      # open the layout, terminals run Cla
 claude-launcher-close                       # close the most recent Claude layout
 
 copilot-launcher [folder]                   # open the layout, terminals run the Copilot CLI
+codex-launcher   [folder]                   # open the layout, terminals run the Codex CLI
 ```
 
 - `folder` — the directory to open VS Code and the terminals in. Defaults to the current
@@ -114,6 +118,7 @@ Each terminal runs, in that folder:
 
 - `claude-launcher`  → `claude --dangerously-skip-permissions [--plugin-dir <plugin-dir>]`
 - `copilot-launcher` → `copilot --allow-all --autopilot`
+- `codex-launcher`   → `codex --dangerously-bypass-approvals-and-sandbox`
 
 `--allow-all` is the Copilot analog of Claude Code's `--dangerously-skip-permissions`: it
 auto-approves tools, paths, and URLs for the session. `--autopilot` starts the session in
@@ -121,6 +126,11 @@ autopilot mode. `copilot-launcher` needs the [GitHub Copilot
 CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli) on your `PATH`
 (`npm install -g @github/copilot`); if it isn't found, the terminal prints an install hint and
 drops into a normal shell.
+
+`--dangerously-bypass-approvals-and-sandbox` is the Codex analog: Codex never asks for approval
+and runs its commands without its sandbox. `codex-launcher` looks for `codex` on your `PATH`, then
+falls back to `~/.local/bin/codex` (where the standalone installer puts it); if neither exists, the
+terminal prints an install hint (`npm install -g @openai/codex`) and drops into a normal shell.
 
 ## Architecture
 
@@ -133,6 +143,7 @@ launcher is a thin wrapper that sources it and supplies only the CLI-specific bi
 | `launcher-common.sh` | Shared engine. Sourced, never run directly. |
 | `claude-launcher` | Sets name/env-prefix + a `launcher_build_command` hook that runs Claude Code; records launches (`LAUNCHER_RECORD=1`). |
 | `copilot-launcher` | Same, but its hook runs the Copilot CLI; no recording (`LAUNCHER_RECORD=0`), no close command. |
+| `codex-launcher` | Same, but its hook runs the Codex CLI; no recording, no close command. |
 | `claude-launcher-close` | Tears down a recorded Claude launch (see below). |
 
 To add another CLI, copy a wrapper, change `LAUNCHER_NAME`, `LAUNCHER_ENV_PREFIX`, and the one
@@ -179,15 +190,16 @@ launch).
 Make the launchers executable and symlink them onto your `PATH`:
 
 ```sh
-chmod +x claude-launcher copilot-launcher claude-launcher-close
+chmod +x claude-launcher copilot-launcher codex-launcher claude-launcher-close
 ln -sf "$PWD/claude-launcher"       ~/.local/bin/claude-launcher
 ln -sf "$PWD/copilot-launcher"      ~/.local/bin/copilot-launcher
+ln -sf "$PWD/codex-launcher"        ~/.local/bin/codex-launcher
 ln -sf "$PWD/claude-launcher-close" ~/.local/bin/claude-launcher-close
 ```
 
 (`~/.local/bin` is already on your `PATH`.) You do **not** symlink `launcher-common.sh` — each
 launcher resolves its own symlink and sources the library from wherever the real script lives, so
-keep `launcher-common.sh` sitting next to `claude-launcher` and `copilot-launcher` in this repo.
+keep `launcher-common.sh` sitting next to the launchers in this repo.
 
 ## One-time permission: Accessibility
 
@@ -214,6 +226,7 @@ claude-launcher  [folder] [plugin-dir]            # open the layout, consoles ru
 claude-launcher-close                             # close the most recent Claude layout
 
 copilot-launcher [folder]                         # open the layout, consoles run the Copilot CLI
+codex-launcher   [folder]                         # open the layout, consoles run the Codex CLI
 ```
 
 Differences from the macOS behavior:

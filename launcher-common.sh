@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 #
-# launcher-common.sh — shared engine behind `claude-launcher` and
-# `copilot-launcher`. It tiles windows on the current Space (virtual desktop):
+# launcher-common.sh: shared engine behind `claude-launcher`,
+# `copilot-launcher`, and `codex-launcher`. It tiles windows on the current
+# Space (virtual desktop):
 #
 #   Left half   -> Visual Studio Code, opened on the target folder.
 #   Right half  -> Terminal.app windows, each running an AI coding CLI in that

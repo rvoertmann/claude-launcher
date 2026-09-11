@@ -1,7 +1,8 @@
 #Requires -Version 7.0
 #
-# LauncherCommon.psm1 — shared engine behind `claude-launcher.ps1` and
-# `copilot-launcher.ps1`. Windows port of `launcher-common.sh`; see
+# LauncherCommon.psm1: shared engine behind `claude-launcher.ps1`,
+# `copilot-launcher.ps1`, and `codex-launcher.ps1`. Windows port of
+# `launcher-common.sh`; see
 # docs/windows-port-plan.md for the full design. Tiles windows on the
 # current desktop:
 #

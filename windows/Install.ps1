@@ -25,6 +25,7 @@ $repoWindowsDir = $PSScriptRoot
 $shims = @{
     'claude-launcher.cmd'       = 'claude-launcher.ps1'
     'copilot-launcher.cmd'      = 'copilot-launcher.ps1'
+    'codex-launcher.cmd'        = 'codex-launcher.ps1'
     'claude-launcher-close.cmd' = 'claude-launcher-close.ps1'
 }
 
@@ -54,4 +55,5 @@ Write-Host ''
 Write-Host 'Install complete. From a new terminal:'
 Write-Host '  claude-launcher [folder] [plugin-dir]'
 Write-Host '  copilot-launcher [folder]'
+Write-Host '  codex-launcher [folder]'
 Write-Host '  claude-launcher-close'
